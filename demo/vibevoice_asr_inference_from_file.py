@@ -67,6 +67,85 @@ class VibeVoiceASRBatchInference:
         self.model.eval()
         
         print(f"Model loaded successfully on {self.device}")
+
+    @staticmethod
+    def _normalize_generated_text(text: str) -> str:
+        normalized = (text or "").strip()
+        normalized = re.sub(r"^\s*assistant\s*[:\n\r]*", "", normalized, flags=re.IGNORECASE)
+        return normalized.strip()
+
+    @staticmethod
+    def _extract_json_payload(text: str) -> Optional[str]:
+        if not text:
+            return None
+        if "```json" in text:
+            json_start = text.find("```json") + 7
+            json_end = text.find("```", json_start)
+            if json_end > json_start:
+                return text[json_start:json_end].strip()
+
+        json_start = text.find("[")
+        if json_start == -1:
+            json_start = text.find("{")
+        if json_start == -1:
+            return None
+
+        bracket_count = 0
+        json_end = -1
+        for i in range(json_start, len(text)):
+            if text[i] in "[{":
+                bracket_count += 1
+            elif text[i] in "]}":
+                bracket_count -= 1
+                if bracket_count == 0:
+                    json_end = i + 1
+                    break
+        if json_end == -1:
+            return None
+        return text[json_start:json_end]
+
+    def _parse_segments_with_fallback(self, text: str) -> List[Dict[str, Any]]:
+        try:
+            parsed = self.processor.post_process_transcription(text)
+            if parsed:
+                return parsed
+        except Exception as e:
+            print(f"Warning: Failed to parse structured output: {e}")
+
+        normalized = self._normalize_generated_text(text)
+        payload = self._extract_json_payload(normalized)
+        if not payload:
+            return []
+
+        try:
+            result = json.loads(payload)
+            if isinstance(result, dict):
+                result = [result]
+            if not isinstance(result, list):
+                return []
+        except Exception:
+            return []
+
+        key_mapping = {
+            "Start time": "start_time",
+            "Start": "start_time",
+            "End time": "end_time",
+            "End": "end_time",
+            "Speaker ID": "speaker_id",
+            "Speaker": "speaker_id",
+            "Content": "text",
+        }
+        cleaned_result: List[Dict[str, Any]] = []
+        for item in result:
+            if not isinstance(item, dict):
+                continue
+            cleaned_item: Dict[str, Any] = {}
+            for key, mapped_key in key_mapping.items():
+                if key in item:
+                    cleaned_item[mapped_key] = item[key]
+            if cleaned_item:
+                cleaned_result.append(cleaned_item)
+        return cleaned_result
     
     def _prepare_generation_config(
         self,
@@ -75,6 +154,8 @@ class VibeVoiceASRBatchInference:
         top_p: float = 0.9,
         do_sample: bool = True,
         num_beams: int = 1,
+        repetition_penalty: float = 1.0,
+        no_repeat_ngram_size: int = 0,
     ) -> dict:
         """Prepare generation configuration."""
         config = {
@@ -82,6 +163,10 @@ class VibeVoiceASRBatchInference:
             "pad_token_id": self.processor.pad_id,
             "eos_token_id": self.processor.tokenizer.eos_token_id,
         }
+        if repetition_penalty and repetition_penalty > 1.0:
+            config["repetition_penalty"] = repetition_penalty
+        if no_repeat_ngram_size and no_repeat_ngram_size > 0:
+            config["no_repeat_ngram_size"] = no_repeat_ngram_size
         
         # Beam search vs sampling
         if num_beams > 1:
@@ -104,6 +189,8 @@ class VibeVoiceASRBatchInference:
         top_p: float = 1.0,
         do_sample: bool = True,
         num_beams: int = 1,
+        repetition_penalty: float = 1.0,
+        no_repeat_ngram_size: int = 0,
     ) -> List[Dict[str, Any]]:
         """
         Transcribe multiple audio files/arrays in a single batch.
@@ -149,6 +236,8 @@ class VibeVoiceASRBatchInference:
             top_p=top_p,
             do_sample=do_sample,
             num_beams=num_beams,
+            repetition_penalty=repetition_penalty,
+            no_repeat_ngram_size=no_repeat_ngram_size,
         )
         
         start_time = time.time()
@@ -176,13 +265,8 @@ class VibeVoiceASRBatchInference:
                 generated_ids = generated_ids[:eos_positions[0] + 1]
             
             generated_text = self.processor.decode(generated_ids, skip_special_tokens=True)
-            
-            # Parse structured output
-            try:
-                transcription_segments = self.processor.post_process_transcription(generated_text)
-            except Exception as e:
-                print(f"Warning: Failed to parse structured output: {e}")
-                transcription_segments = []
+            normalized_text = self._normalize_generated_text(generated_text)
+            transcription_segments = self._parse_segments_with_fallback(generated_text)
             
             # Get file name based on input type
             if isinstance(audio_input, str):
@@ -195,6 +279,7 @@ class VibeVoiceASRBatchInference:
             results.append({
                 "file": file_name,
                 "raw_text": generated_text,
+                "normalized_text": normalized_text,
                 "segments": transcription_segments,
                 "generation_time": generation_time / batch_size,
             })
@@ -213,6 +298,8 @@ class VibeVoiceASRBatchInference:
         top_p: float = 1.0,
         do_sample: bool = True,
         num_beams: int = 1,
+        repetition_penalty: float = 1.0,
+        no_repeat_ngram_size: int = 0,
     ) -> List[Dict[str, Any]]:
         """
         Transcribe multiple audio files/arrays with automatic batching.
@@ -243,6 +330,8 @@ class VibeVoiceASRBatchInference:
                 top_p=top_p,
                 do_sample=do_sample,
                 num_beams=num_beams,
+                repetition_penalty=repetition_penalty,
+                no_repeat_ngram_size=no_repeat_ngram_size,
             )
             all_results.extend(batch_results)
         
@@ -263,6 +352,16 @@ def print_result(result: Dict[str, Any]):
                   f"Speaker {seg.get('speaker_id', 'N/A')}: {seg.get('text', '')}...")
         if len(result['segments']) > 50:
             print(f"  ... and {len(result['segments']) - 50} more segments")
+
+
+def _json_default_serializer(obj):
+    if isinstance(obj, np.generic):
+        return obj.item()
+    if isinstance(obj, np.ndarray):
+        return obj.tolist()
+    if isinstance(obj, Path):
+        return str(obj)
+    return str(obj)
 
 
 def load_dataset_and_concatenate(
@@ -471,11 +570,29 @@ def main():
         help="Number of beams for beam search. Use 1 for greedy/sampling"
     )
     parser.add_argument(
+        "--repetition_penalty",
+        type=float,
+        default=1.0,
+        help="Penalty for repeated tokens (>1.0 suppresses repetition)"
+    )
+    parser.add_argument(
+        "--no_repeat_ngram_size",
+        type=int,
+        default=0,
+        help="Disallow repeated n-grams of this size (0 disables)"
+    )
+    parser.add_argument(
         "--attn_implementation",
         type=str,
         default="auto",
         choices=["flash_attention_2", "sdpa", "eager", "auto"],
         help="Attention implementation to use. 'auto' will select the best available for your device (flash_attention_2 for CUDA, sdpa for MPS/CPU/XPU)"
+    )
+    parser.add_argument(
+        "--output_json",
+        type=str,
+        default="",
+        help="Optional output path to save all inference results as JSON"
     )
     
     args = parser.parse_args()
@@ -564,6 +681,8 @@ def main():
         top_p=args.top_p,
         do_sample=do_sample,
         num_beams=args.num_beams,
+        repetition_penalty=args.repetition_penalty,
+        no_repeat_ngram_size=args.no_repeat_ngram_size,
     )
     
     # Print results
@@ -573,6 +692,33 @@ def main():
     for result in all_results:
         print("\n" + "-"*60)
         print_result(result)
+
+    if args.output_json:
+        output_path = Path(args.output_json)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(output_path, "w", encoding="utf-8") as f:
+            json.dump(
+                {
+                    "model_path": args.model_path,
+                    "device": args.device,
+                    "attn_implementation": args.attn_implementation,
+                    "generation_config": {
+                        "max_new_tokens": args.max_new_tokens,
+                        "temperature": args.temperature,
+                        "top_p": args.top_p,
+                        "num_beams": args.num_beams,
+                        "repetition_penalty": args.repetition_penalty,
+                        "no_repeat_ngram_size": args.no_repeat_ngram_size,
+                    },
+                    "num_inputs": len(all_audio_inputs),
+                    "results": all_results,
+                },
+                f,
+                ensure_ascii=False,
+                indent=2,
+                default=_json_default_serializer,
+            )
+        print(f"\nSaved inference results to: {output_path}")
 
 
 if __name__ == "__main__":
