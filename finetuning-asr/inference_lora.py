@@ -12,11 +12,16 @@ Usage:
 """
 
 import argparse
+import json
+from pathlib import Path
+
 import torch
 
 from peft import PeftModel
 
-from vibevoice.modular.modeling_vibevoice_asr import VibeVoiceASRForConditionalGeneration
+from vibevoice.modular.modeling_vibevoice_asr import (
+    VibeVoiceASRForConditionalGeneration,
+)
 from vibevoice.processor.vibevoice_asr_processor import VibeVoiceASRProcessor
 
 
@@ -28,46 +33,45 @@ def load_lora_model(
 ):
     """
     Load base model and merge with LoRA weights.
-    
+
     Args:
         base_model_path: Path to base pretrained model
         lora_path: Path to LoRA adapter weights
         device: Device to load model on
         dtype: Data type for model
-        
+
     Returns:
         Tuple of (model, processor)
     """
     print(f"Loading base model from {base_model_path}")
-    
+
     # Load processor
     processor = VibeVoiceASRProcessor.from_pretrained(
-        base_model_path,
-        language_model_pretrained_name="Qwen/Qwen2.5-7B"
+        base_model_path, language_model_pretrained_name="Qwen/Qwen2.5-7B"
     )
-    
+
     # Load base model
     model = VibeVoiceASRForConditionalGeneration.from_pretrained(
         base_model_path,
-        dtype=dtype,
+        torch_dtype=dtype,
         device_map=device if device == "auto" else None,
-        attn_implementation="flash_attention_2",
+        # attn_implementation="flash_attention_2",
         trust_remote_code=True,
     )
-    
+
     if device != "auto":
         model = model.to(device)
-    
+
     # Load LoRA adapter
     print(f"Loading LoRA adapter from {lora_path}")
     model = PeftModel.from_pretrained(model, lora_path)
-    
+
     # Optionally merge LoRA weights into base model for faster inference
     # model = model.merge_and_unload()
-    
+
     model.eval()
     print("Model loaded successfully")
-    
+
     return model, processor
 
 
@@ -82,7 +86,7 @@ def transcribe(
 ):
     """
     Transcribe an audio file using the LoRA fine-tuned model.
-    
+
     Args:
         model: The LoRA fine-tuned model
         processor: The processor
@@ -91,12 +95,12 @@ def transcribe(
         temperature: Sampling temperature (0 = greedy)
         context_info: Optional context info (e.g., hotwords)
         device: Device
-        
+
     Returns:
         Transcription result
     """
     print(f"\nTranscribing: {audio_path}")
-    
+
     # Process audio
     inputs = processor(
         audio=audio_path,
@@ -106,11 +110,12 @@ def transcribe(
         add_generation_prompt=True,
         context_info=context_info,
     )
-    
+
     # Move to device
-    inputs = {k: v.to(device) if isinstance(v, torch.Tensor) else v 
-              for k, v in inputs.items()}
-    
+    inputs = {
+        k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in inputs.items()
+    }
+
     # Generation config
     gen_config = {
         "max_new_tokens": max_new_tokens,
@@ -121,23 +126,26 @@ def transcribe(
     if temperature > 0:
         gen_config["temperature"] = temperature
         gen_config["top_p"] = 0.9
-    
+
     # Generate
     with torch.no_grad():
         output_ids = model.generate(**inputs, **gen_config)
-    
+
     # Decode
-    input_length = inputs['input_ids'].shape[1]
+    input_length = inputs["input_ids"].shape[1]
     generated_ids = output_ids[0, input_length:]
     generated_text = processor.decode(generated_ids, skip_special_tokens=True)
-    
+    cleaned_text = generated_text.strip()
+    if cleaned_text.lower().startswith("assistant"):
+        cleaned_text = cleaned_text.split("\n", 1)[-1].strip()
+
     # Parse structured output
     try:
-        segments = processor.post_process_transcription(generated_text)
+        segments = processor.post_process_transcription(cleaned_text)
     except Exception as e:
         print(f"Warning: Failed to parse structured output: {e}")
         segments = []
-    
+
     return {
         "raw_text": generated_text,
         "segments": segments,
@@ -145,53 +153,52 @@ def transcribe(
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Inference with LoRA Fine-tuned VibeVoice ASR")
-    
+    parser = argparse.ArgumentParser(
+        description="Inference with LoRA Fine-tuned VibeVoice ASR"
+    )
+
     parser.add_argument(
         "--base_model",
         type=str,
         default="microsoft/VibeVoice-ASR",
-        help="Path to base pretrained model"
+        help="Path to base pretrained model",
     )
     parser.add_argument(
-        "--lora_path",
-        type=str,
-        required=True,
-        help="Path to LoRA adapter weights"
+        "--lora_path", type=str, required=True, help="Path to LoRA adapter weights"
     )
     parser.add_argument(
-        "--audio_file",
-        type=str,
-        required=True,
-        help="Path to audio file to transcribe"
+        "--audio_file", type=str, required=True, help="Path to audio file to transcribe"
     )
     parser.add_argument(
         "--context_info",
         type=str,
         default=None,
-        help="Optional context info (e.g., 'Hotwords: Tea Brew, Aiden Host')"
+        help="Optional context info (e.g., 'Hotwords: Tea Brew, Aiden Host')",
     )
     parser.add_argument(
-        "--max_new_tokens",
-        type=int,
-        default=4096,
-        help="Maximum tokens to generate"
+        "--max_new_tokens", type=int, default=12000, help="Maximum tokens to generate"
     )
     parser.add_argument(
         "--temperature",
         type=float,
         default=0.0,
-        help="Sampling temperature (0 = greedy)"
+        help="Sampling temperature (0 = greedy)",
     )
     parser.add_argument(
         "--device",
         type=str,
         default="cuda" if torch.cuda.is_available() else "cpu",
-        help="Device to use"
+        help="Device to use",
     )
-    
+    parser.add_argument(
+        "--output_json",
+        type=str,
+        default="lora_inference.json",
+        help="Optional path to save transcription result as JSON",
+    )
+
     args = parser.parse_args()
-    
+
     # Load model
     dtype = torch.bfloat16 if args.device != "cpu" else torch.float32
     model, processor = load_lora_model(
@@ -200,7 +207,7 @@ def main():
         device=args.device,
         dtype=dtype,
     )
-    
+
     # Transcribe
     result = transcribe(
         model=model,
@@ -211,23 +218,39 @@ def main():
         context_info=args.context_info,
         device=args.device,
     )
-    
+
     # Print results
-    print("\n" + "="*60)
+    print("\n" + "=" * 60)
     print("Transcription Result")
-    print("="*60)
-    
+    print("=" * 60)
+
     print("\n--- Raw Output ---")
-    raw_text = result['raw_text']
+    raw_text = result["raw_text"]
     print(raw_text[:2000] + "..." if len(raw_text) > 2000 else raw_text)
-    
-    if result['segments']:
+
+    if result["segments"]:
         print(f"\n--- Structured Output ({len(result['segments'])} segments) ---")
-        for seg in result['segments'][:20]:
-            print(f"[{seg.get('start_time', 'N/A')} - {seg.get('end_time', 'N/A')}] "
-                  f"Speaker {seg.get('speaker_id', 'N/A')}: {seg.get('text', '')[:80]}...")
-        if len(result['segments']) > 20:
+        for seg in result["segments"][:20]:
+            print(
+                f"[{seg.get('start_time', 'N/A')} - {seg.get('end_time', 'N/A')}] "
+                f"Speaker {seg.get('speaker_id', 'N/A')}: {seg.get('text', '')[:80]}..."
+            )
+        if len(result["segments"]) > 20:
             print(f"  ... and {len(result['segments']) - 20} more segments")
+
+    if args.output_json:
+        output_path = Path(args.output_json)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "audio_file": args.audio_file,
+            "context_info": args.context_info,
+            "raw_text": result["raw_text"],
+            "segments": result["segments"],
+        }
+        output_path.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        print(f"\nSaved transcription to {output_path.resolve()}")
 
 
 if __name__ == "__main__":

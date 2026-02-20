@@ -18,7 +18,7 @@ classifiers = [
 ]
 dependencies = [
     "torch",
-    "transformers>=4.51.3,<5.0.0",
+    "transformers>=4.51.3",
     "accelerate",
     "llvmlite>=0.40.0",
     "numba>=0.57.0",
@@ -36,12 +36,13 @@ dependencies = [
     "fastapi",
     "pydub",
     "requests",
+    "peft>=0.17.1",
 ]
 
 
 [project.optional-dependencies]
 streamingtts = [
-  "transformers==4.51.3", 
+  "transformers==4.51.3",
 ]
 
 [project.entry-points."vllm.general_plugins"]
