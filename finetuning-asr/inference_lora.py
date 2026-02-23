@@ -14,6 +14,8 @@ Usage:
 import argparse
 import json
 from pathlib import Path
+import re
+from typing import Optional, List, Dict, Any
 
 import torch
 
@@ -23,6 +25,73 @@ from vibevoice.modular.modeling_vibevoice_asr import (
     VibeVoiceASRForConditionalGeneration,
 )
 from vibevoice.processor.vibevoice_asr_processor import VibeVoiceASRProcessor
+
+
+def _parse_time_seconds(value) -> Optional[float]:
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+
+    text = str(value).strip()
+    if not text:
+        return None
+    try:
+        return float(text)
+    except ValueError:
+        pass
+
+    parts = text.split(":")
+    try:
+        if len(parts) == 3:
+            h, m, s = parts
+            return int(h) * 3600 + int(m) * 60 + float(s)
+        if len(parts) == 2:
+            m, s = parts
+            return int(m) * 60 + float(s)
+    except ValueError:
+        return None
+    return None
+
+
+def _rttm_file_id(name: str) -> str:
+    base = Path(str(name)).stem or "audio"
+    cleaned = re.sub(r"\s+", "_", base)
+    cleaned = re.sub(r"[^\w.\-]+", "_", cleaned, flags=re.UNICODE)
+    return cleaned or "audio"
+
+
+def _segments_to_rttm_lines(
+    segments: List[Dict[str, Any]], file_id: str
+) -> List[str]:
+    lines: List[str] = []
+    for seg in segments or []:
+        speaker_id = seg.get("speaker_id")
+        if speaker_id is None:
+            continue
+
+        start = _parse_time_seconds(seg.get("start_time"))
+        end = _parse_time_seconds(seg.get("end_time"))
+        if start is None or end is None:
+            continue
+
+        dur = end - start
+        if dur <= 0:
+            continue
+
+        speaker_label = f"speaker_{speaker_id}"
+        lines.append(
+            f"SPEAKER {file_id} 1 {start:.3f} {dur:.3f} <NA> <NA> {speaker_label} <NA> <NA>"
+        )
+    return lines
+
+
+def _default_rttm_path(output_json: Optional[str], output_rttm: Optional[str]) -> Optional[Path]:
+    if output_rttm:
+        return Path(output_rttm)
+    if output_json:
+        return Path(output_json).with_suffix(".rttm")
+    return None
 
 
 def load_lora_model(
@@ -196,6 +265,12 @@ def main():
         default="lora_inference.json",
         help="Optional path to save transcription result as JSON",
     )
+    parser.add_argument(
+        "--output_rttm",
+        type=str,
+        default="",
+        help="Optional path to save speaker segments as RTTM (defaults to output_json with .rttm extension)",
+    )
 
     args = parser.parse_args()
 
@@ -251,6 +326,20 @@ def main():
             json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
         )
         print(f"\nSaved transcription to {output_path.resolve()}")
+
+    rttm_path = _default_rttm_path(args.output_json, args.output_rttm)
+    if rttm_path:
+        rttm_lines = _segments_to_rttm_lines(
+            result.get("segments", []), _rttm_file_id(args.audio_file)
+        )
+        rttm_path.parent.mkdir(parents=True, exist_ok=True)
+        rttm_text = "\n".join(rttm_lines)
+        if rttm_text:
+            rttm_text += "\n"
+        rttm_path.write_text(rttm_text, encoding="utf-8")
+        print(
+            f"Saved RTTM ({len(rttm_lines)} speaker segments) to {rttm_path.resolve()}"
+        )
 
 
 if __name__ == "__main__":
