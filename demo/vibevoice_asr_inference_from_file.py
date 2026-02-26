@@ -7,6 +7,7 @@ between batch processing and single-sample processing.
 """
 
 import os
+import random
 import torch
 import numpy as np
 from pathlib import Path
@@ -22,6 +23,20 @@ from vibevoice.modular.modeling_vibevoice_asr import (
 from vibevoice.processor.vibevoice_asr_processor import VibeVoiceASRProcessor
 
 
+def set_global_seed(seed: int) -> None:
+    """Set random seeds for reproducible inference."""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+    # Prefer deterministic kernels when available.
+    if hasattr(torch.backends, "cudnn"):
+        torch.backends.cudnn.benchmark = False
+        torch.backends.cudnn.deterministic = True
+
+
 class VibeVoiceASRBatchInference:
     """Batch inference wrapper for VibeVoice ASR model."""
 
@@ -31,6 +46,7 @@ class VibeVoiceASRBatchInference:
         device: str = "cuda",
         dtype: torch.dtype = torch.bfloat16,
         attn_implementation: str = "sdpa",
+        seed: Optional[int] = None,
     ):
         """
         Initialize the ASR batch inference pipeline.
@@ -65,6 +81,7 @@ class VibeVoiceASRBatchInference:
             device if device != "auto" else next(self.model.parameters()).device
         )
         self.dtype = dtype
+        self.seed = seed
         self.model.eval()
 
         print(f"Model loaded successfully on {self.device}")
@@ -246,6 +263,9 @@ class VibeVoiceASRBatchInference:
         )
 
         start_time = time.time()
+
+        if self.seed is not None:
+            set_global_seed(self.seed)
 
         with torch.no_grad():
             output_ids = self.model.generate(**inputs, **generation_config)
@@ -695,8 +715,18 @@ def main():
         default="",
         help="Optional output path to save speaker segments as RTTM (defaults to output_json with .rttm extension)",
     )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=42,
+        help="Random seed for reproducible audio-token sampling and generation",
+    )
 
     args = parser.parse_args()
+
+    if args.seed is not None:
+        set_global_seed(args.seed)
+        print(f"Using random seed: {args.seed}")
 
     # Auto-detect best attention implementation based on device
     if args.attn_implementation == "auto":
@@ -766,6 +796,7 @@ def main():
         device=args.device,
         dtype=model_dtype,
         attn_implementation=args.attn_implementation,
+        seed=args.seed,
     )
 
     # If temperature is 0, use greedy decoding (no sampling)
@@ -815,6 +846,7 @@ def main():
                         "repetition_penalty": args.repetition_penalty,
                         "no_repeat_ngram_size": args.no_repeat_ngram_size,
                     },
+                    "seed": args.seed,
                     "num_inputs": len(all_audio_inputs),
                     "results": all_results,
                 },
