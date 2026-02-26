@@ -14,9 +14,11 @@ Usage:
 import argparse
 import json
 from pathlib import Path
+import random
 import re
 from typing import Optional, List, Dict, Any
 
+import numpy as np
 import torch
 
 from peft import PeftModel
@@ -25,6 +27,17 @@ from vibevoice.modular.modeling_vibevoice_asr import (
     VibeVoiceASRForConditionalGeneration,
 )
 from vibevoice.processor.vibevoice_asr_processor import VibeVoiceASRProcessor
+
+
+def set_global_seed(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    if hasattr(torch.backends, "cudnn"):
+        torch.backends.cudnn.benchmark = False
+        torch.backends.cudnn.deterministic = True
 
 
 def _parse_time_seconds(value) -> Optional[float]:
@@ -150,8 +163,10 @@ def transcribe(
     audio_path: str,
     max_new_tokens: int = 4096,
     temperature: float = 0.0,
+    num_beams: int = 1,
     context_info: str = None,
     device: str = "cuda",
+    seed: Optional[int] = None,
 ):
     """
     Transcribe an audio file using the LoRA fine-tuned model.
@@ -162,8 +177,10 @@ def transcribe(
         audio_path: Path to audio file
         max_new_tokens: Maximum tokens to generate
         temperature: Sampling temperature (0 = greedy)
+        num_beams: Beam size for text generation (1 = greedy/sampling)
         context_info: Optional context info (e.g., hotwords)
         device: Device
+        seed: Optional random seed for reproducibility
 
     Returns:
         Transcription result
@@ -190,13 +207,16 @@ def transcribe(
         "max_new_tokens": max_new_tokens,
         "pad_token_id": processor.pad_id,
         "eos_token_id": processor.tokenizer.eos_token_id,
-        "do_sample": temperature > 0,
+        "num_beams": num_beams,
+        "do_sample": False if num_beams > 1 else (temperature > 0),
     }
-    if temperature > 0:
+    if gen_config["do_sample"]:
         gen_config["temperature"] = temperature
         gen_config["top_p"] = 0.9
 
     # Generate
+    if seed is not None:
+        set_global_seed(seed)
     with torch.no_grad():
         output_ids = model.generate(**inputs, **gen_config)
 
@@ -254,6 +274,18 @@ def main():
         help="Sampling temperature (0 = greedy)",
     )
     parser.add_argument(
+        "--num_beams",
+        type=int,
+        default=1,
+        help="Beam size for generation (1 = greedy/sampling, >1 = beam search)",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=42,
+        help="Random seed for reproducible audio-token sampling and generation",
+    )
+    parser.add_argument(
         "--device",
         type=str,
         default="cuda" if torch.cuda.is_available() else "cpu",
@@ -274,6 +306,10 @@ def main():
 
     args = parser.parse_args()
 
+    if args.seed is not None:
+        set_global_seed(args.seed)
+        print(f"Using random seed: {args.seed}")
+
     # Load model
     dtype = torch.bfloat16 if args.device != "cpu" else torch.float32
     model, processor = load_lora_model(
@@ -290,8 +326,10 @@ def main():
         audio_path=args.audio_file,
         max_new_tokens=args.max_new_tokens,
         temperature=args.temperature,
+        num_beams=args.num_beams,
         context_info=args.context_info,
         device=args.device,
+        seed=args.seed,
     )
 
     # Print results
@@ -319,6 +357,12 @@ def main():
         payload = {
             "audio_file": args.audio_file,
             "context_info": args.context_info,
+            "generation_config": {
+                "max_new_tokens": args.max_new_tokens,
+                "temperature": args.temperature,
+                "num_beams": args.num_beams,
+            },
+            "seed": args.seed,
             "raw_text": result["raw_text"],
             "segments": result["segments"],
         }
