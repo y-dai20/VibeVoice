@@ -434,9 +434,7 @@ def _rttm_file_id(name: Any) -> str:
     return cleaned or "audio"
 
 
-def _segments_to_rttm_lines(
-    segments: List[Dict[str, Any]], file_id: str
-) -> List[str]:
+def _segments_to_rttm_lines(segments: List[Dict[str, Any]], file_id: str) -> List[str]:
     lines: List[str] = []
     for seg in segments or []:
         speaker_id = seg.get("speaker_id")
@@ -666,7 +664,7 @@ def main():
     parser.add_argument(
         "--max_new_tokens",
         type=int,
-        default=32768,
+        default=8192,
         help="Maximum number of tokens to generate",
     )
     parser.add_argument(
@@ -687,7 +685,7 @@ def main():
     parser.add_argument(
         "--repetition_penalty",
         type=float,
-        default=1.0,
+        default=1.5,
         help="Penalty for repeated tokens (>1.0 suppresses repetition)",
     )
     parser.add_argument(
@@ -863,7 +861,8 @@ def main():
         for result in all_results:
             rttm_lines.extend(
                 _segments_to_rttm_lines(
-                    result.get("segments", []), _rttm_file_id(result.get("file", "audio"))
+                    result.get("segments", []),
+                    _rttm_file_id(result.get("file", "audio")),
                 )
             )
         rttm_path.parent.mkdir(parents=True, exist_ok=True)
