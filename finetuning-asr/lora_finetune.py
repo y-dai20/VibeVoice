@@ -10,7 +10,7 @@ import json
 import logging
 from pathlib import Path
 from typing import List, Dict, Any, Optional, Tuple, Set
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 
 import torch
 import torch.nn as nn
@@ -458,6 +458,31 @@ class SafeTrainer(Trainer):
             return torch.tensor(0.0, device=self.args.device)
 
 
+def save_argument_snapshot(
+    model_args: ModelArguments,
+    data_args: DataArguments,
+    lora_args: LoraArguments,
+    training_args: TrainingArguments,
+    output_dir: str,
+) -> None:
+    """Save only the 4 training argument groups as JSON."""
+    output_path = Path(output_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
+
+    args_payload = {
+        "model_args": asdict(model_args),
+        "data_args": asdict(data_args),
+        "lora_args": asdict(lora_args),
+        "training_args": training_args.to_dict(),
+    }
+
+    args_json_path = output_path / "training_args.json"
+    with open(args_json_path, "w", encoding="utf-8") as f:
+        json.dump(args_payload, f, ensure_ascii=False, indent=2, default=str)
+
+    logger.info("Saved argument snapshot to %s", args_json_path)
+
+
 def get_lora_config(
     r: int = 16,
     lora_alpha: int = 32,
@@ -664,6 +689,13 @@ def train(
     # Save final model
     logger.info(f"Saving model to {training_args.output_dir}")
     trainer.save_model(training_args.output_dir)
+    save_argument_snapshot(
+        model_args=model_args,
+        data_args=data_args,
+        lora_args=lora_args,
+        training_args=training_args,
+        output_dir=training_args.output_dir,
+    )
 
     # Save training metrics
     metrics = train_result.metrics
