@@ -37,6 +37,7 @@ dependencies = [
     "pydub",
     "requests",
     "peft>=0.17.1",
+    "pyannote-metrics>=3.2.1",
 ]
 
 
