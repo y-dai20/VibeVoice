@@ -12,17 +12,17 @@ HF_HUB_ENABLE_HF_TRANSFER=0 HF_HUB_DISABLE_XET=1 uv run torchrun --nproc_per_nod
   --data_dir ./toy_dataset \
   --output_dir "${output_dir}" \
   --lora_r 4 \
-  --lora_alpha 4 \
+  --lora_alpha 8 \
   --lora_dropout 0.05 \
-  --num_train_epochs 3 \
+  --num_train_epochs 10 \
   --per_device_train_batch_size 1 \
   --gradient_accumulation_steps 4 \
-  --learning_rate 1e-5 \
-  --warmup_ratio 0.1 \
-  --weight_decay 0.01 \
+  --learning_rate 1e-4 \
+  --warmup_ratio 0.0 \
+  --weight_decay 0.0 \
   --max_grad_norm 1.0 \
   --logging_steps 10 \
-  --save_steps 100 \
+  --save_steps 10 \
   --gradient_checkpointing \
   --bf16 \
   --report_to none
