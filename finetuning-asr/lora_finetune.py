@@ -872,12 +872,42 @@ class SafeTrainer(Trainer):
             return torch.tensor(0.0, device=self.args.device)
 
 
+def setup_output_logging(output_dir: str, log_filename: str = "training.log") -> Path:
+    """Mirror logs to a file in the output directory."""
+    output_path = Path(output_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
+
+    log_path = output_path / log_filename
+    root_logger = logging.getLogger()
+    formatter = logging.Formatter(
+        fmt="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+
+    for handler in root_logger.handlers:
+        if (
+            isinstance(handler, logging.FileHandler)
+            and Path(handler.baseFilename) == log_path
+        ):
+            return log_path
+
+    file_handler = logging.FileHandler(log_path, encoding="utf-8")
+    file_handler.setLevel(root_logger.level)
+    file_handler.setFormatter(formatter)
+    root_logger.addHandler(file_handler)
+
+    logger.info("Logging to %s", log_path)
+    return log_path
+
+
 def save_argument_snapshot(
     model_args: ModelArguments,
     data_args: DataArguments,
     lora_args: LoraArguments,
     training_args: TrainingArguments,
     output_dir: str,
+    dataset_summary: Optional[Dict[str, Any]] = None,
+    log_path: Optional[str] = None,
 ) -> None:
     """Save only the 4 training argument groups as JSON."""
     output_path = Path(output_dir)
@@ -889,6 +919,10 @@ def save_argument_snapshot(
         "lora_args": asdict(lora_args),
         "training_args": training_args.to_dict(),
     }
+    if dataset_summary is not None:
+        args_payload["dataset_summary"] = dataset_summary
+    if log_path is not None:
+        args_payload["log_path"] = log_path
 
     args_json_path = output_path / "training_args.json"
     with open(args_json_path, "w", encoding="utf-8") as f:
@@ -1022,6 +1056,16 @@ def train(
         training_args: HuggingFace TrainingArguments
         gradient_checkpointing: Whether to use gradient checkpointing
     """
+    log_path = setup_output_logging(training_args.output_dir)
+    save_argument_snapshot(
+        model_args=model_args,
+        data_args=data_args,
+        lora_args=lora_args,
+        training_args=training_args,
+        output_dir=training_args.output_dir,
+        log_path=str(log_path),
+    )
+
     # Set seed
     torch.manual_seed(training_args.seed)
     np.random.seed(training_args.seed)
@@ -1056,9 +1100,12 @@ def train(
         skip_error_samples=data_args.skip_error_samples,
     )
 
-    if len(train_dataset) == 0:
-        logger.error("No training samples found!")
-        return
+    dataset_summary = {
+        "train": {
+            "data_dir": data_args.data_dir,
+            "num_samples": len(train_dataset),
+        }
+    }
 
     # Create test dataset if test_data_dir is provided
     test_dataset = None
@@ -1072,6 +1119,23 @@ def train(
             skip_error_samples=data_args.skip_error_samples,
         )
         logger.info(f"Loaded {len(test_dataset)} test samples")
+        dataset_summary["test"] = {
+            "data_dir": data_args.test_data_dir,
+            "num_samples": len(test_dataset),
+        }
+    save_argument_snapshot(
+        model_args=model_args,
+        data_args=data_args,
+        lora_args=lora_args,
+        training_args=training_args,
+        output_dir=training_args.output_dir,
+        dataset_summary=dataset_summary,
+        log_path=str(log_path),
+    )
+
+    if len(train_dataset) == 0:
+        logger.error("No training samples found!")
+        return
 
     # Create data collator
     data_collator = VibeVoiceASRDataCollator(
@@ -1136,6 +1200,8 @@ def train(
         lora_args=lora_args,
         training_args=training_args,
         output_dir=training_args.output_dir,
+        dataset_summary=dataset_summary,
+        log_path=str(log_path),
     )
 
     # Save training metrics
