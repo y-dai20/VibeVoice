@@ -11,7 +11,6 @@ import logging
 from pathlib import Path
 from typing import List, Dict, Any, Optional, Tuple, Set
 from dataclasses import asdict, dataclass, field
-from io import StringIO
 
 import torch
 import torch.nn as nn
@@ -73,7 +72,9 @@ class DataArguments:
     )
     test_data_dir: Optional[str] = field(
         default=None,
-        metadata={"help": "Directory containing test data for periodic inference evaluation"},
+        metadata={
+            "help": "Directory containing test data for periodic inference evaluation"
+        },
     )
     max_audio_length: Optional[float] = field(
         default=None,
@@ -425,11 +426,11 @@ def extract_json_array(text: str) -> str:
     text = text.strip()
 
     # Find the first '[' and last ']' to extract the JSON array
-    start_idx = text.find('[')
-    end_idx = text.rfind(']')
+    start_idx = text.find("[")
+    end_idx = text.rfind("]")
 
     if start_idx != -1 and end_idx != -1 and end_idx > start_idx:
-        return text[start_idx:end_idx + 1]
+        return text[start_idx : end_idx + 1]
 
     return text
 
@@ -458,10 +459,13 @@ def json_to_rttm(json_str: str, file_id: str = "audio") -> str:
 
     rttm_lines = []
     for seg in segments:
-        start = seg.get("Start", 0.0)
-        end = seg.get("End", 0.0)
+        if any(key not in seg for key in ("Start", "End", "Speaker")):
+            continue
+
+        start = seg["Start"]
+        end = seg["End"]
         duration = end - start
-        speaker = seg.get("Speaker", 0)
+        speaker = seg["Speaker"]
 
         rttm_line = f"SPEAKER {file_id} 1 {start:.3f} {duration:.3f} <NA> <NA> speaker_{speaker} <NA> <NA>"
         rttm_lines.append(rttm_line)
@@ -500,7 +504,9 @@ def rttm_to_annotation(rttm_str: str, uri: str = "audio") -> Optional[Annotation
     return annotation
 
 
-def calculate_der(reference_rttm: str, hypothesis_rttm: str, uri: str = "audio") -> Optional[Dict[str, float]]:
+def calculate_der(
+    reference_rttm: str, hypothesis_rttm: str, uri: str = "audio"
+) -> Optional[Dict[str, float]]:
     """
     Calculate Diarization Error Rate (DER) between reference and hypothesis.
 
@@ -583,15 +589,19 @@ def run_inference_on_test_set(
                     context_info=context_info,
                 )
 
-                input_ids = torch.tensor([encoding["input_ids"]], dtype=torch.long).to(device)
+                input_ids = torch.tensor([encoding["input_ids"]], dtype=torch.long).to(
+                    device
+                )
                 acoustic_input_mask = torch.tensor(
                     [encoding["acoustic_input_mask"]], dtype=torch.bool
                 ).to(device)
                 speech_tensors = torch.tensor(
                     [encoding["speech"]], dtype=torch.float32
                 ).to(device)
-                speech_masks = torch.zeros((1, encoding["vae_tok_len"]), dtype=torch.bool).to(device)
-                speech_masks[0, :encoding["vae_tok_len"]] = True
+                speech_masks = torch.zeros(
+                    (1, encoding["vae_tok_len"]), dtype=torch.bool
+                ).to(device)
+                speech_masks[0, : encoding["vae_tok_len"]] = True
 
                 outputs = model.generate(
                     input_ids=input_ids,
@@ -607,12 +617,13 @@ def run_inference_on_test_set(
                 )
 
                 predicted_text = processor.tokenizer.decode(
-                    outputs[0][len(encoding["input_ids"]):],
+                    outputs[0][len(encoding["input_ids"]) :],
                     skip_special_tokens=True,
                 )
 
                 ground_truth = test_dataset._format_transcription(
-                    data["segments"], data.get("audio_duration", len(encoding["speech"]) / 24000)
+                    data["segments"],
+                    data.get("audio_duration", len(encoding["speech"]) / 24000),
                 )
 
                 # Convert to RTTM format
@@ -743,9 +754,15 @@ class TestInferenceCallback(TrainerCallback):
                         f.write("=" * 80 + "\n")
                         f.write("DER METRICS:\n")
                         f.write(f"  DER: {result['der_metrics']['DER']:.4f}\n")
-                        f.write(f"  Confusion: {result['der_metrics']['confusion']:.4f}\n")
-                        f.write(f"  False Alarm: {result['der_metrics']['false_alarm']:.4f}\n")
-                        f.write(f"  Missed Detection: {result['der_metrics']['missed_detection']:.4f}\n")
+                        f.write(
+                            f"  Confusion: {result['der_metrics']['confusion']:.4f}\n"
+                        )
+                        f.write(
+                            f"  False Alarm: {result['der_metrics']['false_alarm']:.4f}\n"
+                        )
+                        f.write(
+                            f"  Missed Detection: {result['der_metrics']['missed_detection']:.4f}\n"
+                        )
 
             logger.info(f"Saved RTTM files to {rttm_dir}")
             logger.info(f"Saved text results to {text_dir}")
@@ -754,9 +771,15 @@ class TestInferenceCallback(TrainerCallback):
             der_values = [r["der_metrics"] for r in results if r.get("der_metrics")]
             if der_values:
                 avg_der = sum(m["DER"] for m in der_values) / len(der_values)
-                avg_confusion = sum(m["confusion"] for m in der_values) / len(der_values)
-                avg_false_alarm = sum(m["false_alarm"] for m in der_values) / len(der_values)
-                avg_missed = sum(m["missed_detection"] for m in der_values) / len(der_values)
+                avg_confusion = sum(m["confusion"] for m in der_values) / len(
+                    der_values
+                )
+                avg_false_alarm = sum(m["false_alarm"] for m in der_values) / len(
+                    der_values
+                )
+                avg_missed = sum(m["missed_detection"] for m in der_values) / len(
+                    der_values
+                )
 
                 logger.info(f"\n{'=' * 80}")
                 logger.info(f"Average DER Metrics (over {len(der_values)} samples):")
@@ -775,12 +798,16 @@ class TestInferenceCallback(TrainerCallback):
                     "average_false_alarm": avg_false_alarm,
                     "average_missed_detection": avg_missed,
                 }
-                der_summary_file = results_dir / f"step_{state.global_step}_der_summary.json"
+                der_summary_file = (
+                    results_dir / f"step_{state.global_step}_der_summary.json"
+                )
                 with open(der_summary_file, "w", encoding="utf-8") as f:
                     json.dump(der_summary, f, ensure_ascii=False, indent=2)
 
             if self.save_weights:
-                checkpoint_dir = Path(args.output_dir) / f"checkpoint-step-{state.global_step}"
+                checkpoint_dir = (
+                    Path(args.output_dir) / f"checkpoint-step-{state.global_step}"
+                )
                 checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
                 model.save_pretrained(checkpoint_dir)
