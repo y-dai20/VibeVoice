@@ -29,6 +29,7 @@ from peft import (
     TaskType,
 )
 
+from vibevoice.generation_mixin import ContentNoRepeatGenerationMixin
 from vibevoice.modular.modeling_vibevoice_asr import (
     VibeVoiceASRForConditionalGeneration,
 )
@@ -90,6 +91,24 @@ class DataArguments:
         default=True,
         metadata={
             "help": "If True, dataset errors are logged and skipped instead of aborting training"
+        },
+    )
+    content_no_repeat_ngram_size: int = field(
+        default=0,
+        metadata={
+            "help": 'Apply no-repeat-ngram of this size only inside a JSON "Content" field during test inference'
+        },
+    )
+    content_no_repeat_decode_max_tokens: int = field(
+        default=2048,
+        metadata={
+            "help": 'How many recent tokens to decode when detecting the active JSON "Content" field during test inference'
+        },
+    )
+    content_no_repeat_debug: bool = field(
+        default=False,
+        metadata={
+            "help": 'Print debug logs when the JSON "Content" repetition guard is active during test inference'
         },
     )
 
@@ -548,6 +567,9 @@ def run_inference_on_test_set(
     test_dataset: VibeVoiceASRDataset,
     max_samples: int = 5,
     device: str = "cuda",
+    content_no_repeat_ngram_size: int = 0,
+    content_no_repeat_decode_max_tokens: int = 2048,
+    content_no_repeat_debug: bool = False,
 ) -> List[Dict[str, Any]]:
     """
     Run inference on test dataset samples and return results.
@@ -564,6 +586,12 @@ def run_inference_on_test_set(
     """
     model.eval()
     results = []
+    logits_processor = ContentNoRepeatGenerationMixin.build_content_no_repeat_logits_processor(
+        tokenizer=processor.tokenizer,
+        content_no_repeat_ngram_size=content_no_repeat_ngram_size,
+        content_no_repeat_decode_max_tokens=content_no_repeat_decode_max_tokens,
+        content_no_repeat_debug=content_no_repeat_debug,
+    )
 
     num_samples = min(max_samples, len(test_dataset))
     logger.info(f"Running inference on {num_samples} test samples...")
@@ -603,18 +631,22 @@ def run_inference_on_test_set(
                 ).to(device)
                 speech_masks[0, : encoding["vae_tok_len"]] = True
 
-                outputs = model.generate(
-                    input_ids=input_ids,
-                    acoustic_input_mask=acoustic_input_mask,
-                    speech_tensors=speech_tensors,
-                    speech_masks=speech_masks,
-                    max_new_tokens=8192,
-                    temperature=0.0,
-                    num_beams=3,
-                    do_sample=False,
-                    pad_token_id=processor.pad_id,
-                    eos_token_id=processor.tokenizer.eos_token_id,
-                )
+                generation_kwargs = {
+                    "input_ids": input_ids,
+                    "acoustic_input_mask": acoustic_input_mask,
+                    "speech_tensors": speech_tensors,
+                    "speech_masks": speech_masks,
+                    "max_new_tokens": 8192,
+                    "temperature": 0.0,
+                    "num_beams": 3,
+                    "do_sample": False,
+                    "pad_token_id": processor.pad_id,
+                    "eos_token_id": processor.tokenizer.eos_token_id,
+                }
+                if logits_processor is not None:
+                    generation_kwargs["logits_processor"] = logits_processor
+
+                outputs = model.generate(**generation_kwargs)
 
                 predicted_text = processor.tokenizer.decode(
                     outputs[0][len(encoding["input_ids"]) :],
@@ -674,6 +706,9 @@ class TestInferenceCallback(TrainerCallback):
         eval_steps: int = 100,
         max_test_samples: int = 5,
         save_weights: bool = True,
+        content_no_repeat_ngram_size: int = 0,
+        content_no_repeat_decode_max_tokens: int = 2048,
+        content_no_repeat_debug: bool = False,
     ):
         """
         Initialize the callback.
@@ -690,6 +725,9 @@ class TestInferenceCallback(TrainerCallback):
         self.eval_steps = eval_steps
         self.max_test_samples = max_test_samples
         self.save_weights = save_weights
+        self.content_no_repeat_ngram_size = content_no_repeat_ngram_size
+        self.content_no_repeat_decode_max_tokens = content_no_repeat_decode_max_tokens
+        self.content_no_repeat_debug = content_no_repeat_debug
 
     def on_step_end(self, args, state, control, model=None, **kwargs):
         """Called at the end of each training step."""
@@ -708,6 +746,9 @@ class TestInferenceCallback(TrainerCallback):
                 test_dataset=self.test_dataset,
                 max_samples=self.max_test_samples,
                 device=str(device),
+                content_no_repeat_ngram_size=self.content_no_repeat_ngram_size,
+                content_no_repeat_decode_max_tokens=self.content_no_repeat_decode_max_tokens,
+                content_no_repeat_debug=self.content_no_repeat_debug,
             )
 
             results_dir = Path(args.output_dir) / "test_results"
@@ -1158,6 +1199,9 @@ def train(
             eval_steps=training_args.save_steps,
             max_test_samples=5,
             save_weights=True,
+            content_no_repeat_ngram_size=data_args.content_no_repeat_ngram_size,
+            content_no_repeat_decode_max_tokens=data_args.content_no_repeat_decode_max_tokens,
+            content_no_repeat_debug=data_args.content_no_repeat_debug,
         )
         callbacks.append(test_callback)
         logger.info(f"Test inference will run every {training_args.save_steps} steps")

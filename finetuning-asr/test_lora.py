@@ -34,6 +34,7 @@ from peft import PeftModel
 from pyannote.core import Annotation, Segment
 from pyannote.metrics.diarization import DiarizationErrorRate
 
+from vibevoice.generation_mixin import ContentNoRepeatGenerationMixin
 from vibevoice.modular.modeling_vibevoice_asr import (
     VibeVoiceASRForConditionalGeneration,
 )
@@ -308,6 +309,9 @@ def transcribe(
     context_info: str = None,
     device: str = "cuda",
     seed: Optional[int] = None,
+    content_no_repeat_ngram_size: int = 0,
+    content_no_repeat_decode_max_tokens: int = 2048,
+    content_no_repeat_debug: bool = False,
 ):
     print(f"\nTranscribing: {audio_path}")
 
@@ -334,12 +338,25 @@ def transcribe(
     if gen_config["do_sample"]:
         gen_config["temperature"] = temperature
         gen_config["top_p"] = 0.9
+    logits_processor = ContentNoRepeatGenerationMixin.build_content_no_repeat_logits_processor(
+        tokenizer=processor.tokenizer,
+        content_no_repeat_ngram_size=content_no_repeat_ngram_size,
+        content_no_repeat_decode_max_tokens=content_no_repeat_decode_max_tokens,
+        content_no_repeat_debug=content_no_repeat_debug,
+    )
 
     if seed is not None:
         set_global_seed(seed)
 
     with torch.no_grad():
-        output_ids = model.generate(**inputs, **gen_config)
+        if logits_processor is not None:
+            output_ids = model.generate(
+                **inputs,
+                **gen_config,
+                logits_processor=logits_processor,
+            )
+        else:
+            output_ids = model.generate(**inputs, **gen_config)
 
     input_length = inputs["input_ids"].shape[1]
     generated_ids = output_ids[0, input_length:]
@@ -622,6 +639,7 @@ def main() -> None:
         default="lora_inference_outputs",
         help="Directory for batch per-file outputs",
     )
+    ContentNoRepeatGenerationMixin.add_content_no_repeat_cli_args(parser)
 
     args = parser.parse_args()
 
@@ -674,6 +692,9 @@ def main() -> None:
             context_info=item["context_info"],
             device=args.device,
             seed=args.seed,
+            content_no_repeat_ngram_size=args.content_no_repeat_ngram_size,
+            content_no_repeat_decode_max_tokens=args.content_no_repeat_decode_max_tokens,
+            content_no_repeat_debug=args.content_no_repeat_debug,
         )
 
         hypothesis_rttm_lines = _segments_to_rttm_lines(

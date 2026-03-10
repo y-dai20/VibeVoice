@@ -22,6 +22,7 @@ from typing import List, Dict, Any, Optional
 from vibevoice.modular.modeling_vibevoice_asr import (
     VibeVoiceASRForConditionalGeneration,
 )
+from vibevoice.generation_mixin import ContentNoRepeatGenerationMixin
 from vibevoice.processor.vibevoice_asr_processor import VibeVoiceASRProcessor
 
 
@@ -203,6 +204,20 @@ class VibeVoiceASRBatchInference:
 
         return config
 
+    @staticmethod
+    def _build_logits_processor(
+        tokenizer,
+        content_no_repeat_ngram_size: int = 0,
+        content_no_repeat_decode_max_tokens: int = 2048,
+        content_no_repeat_debug: bool = False,
+    ):
+        return ContentNoRepeatGenerationMixin.build_content_no_repeat_logits_processor(
+            tokenizer=tokenizer,
+            content_no_repeat_ngram_size=content_no_repeat_ngram_size,
+            content_no_repeat_decode_max_tokens=content_no_repeat_decode_max_tokens,
+            content_no_repeat_debug=content_no_repeat_debug,
+        )
+
     def transcribe_batch(
         self,
         audio_inputs: List,
@@ -213,6 +228,9 @@ class VibeVoiceASRBatchInference:
         num_beams: int = 1,
         repetition_penalty: float = 1.0,
         no_repeat_ngram_size: int = 0,
+        content_no_repeat_ngram_size: int = 0,
+        content_no_repeat_decode_max_tokens: int = 2048,
+        content_no_repeat_debug: bool = False,
     ) -> List[Dict[str, Any]]:
         """
         Transcribe multiple audio files/arrays in a single batch.
@@ -263,6 +281,12 @@ class VibeVoiceASRBatchInference:
             repetition_penalty=repetition_penalty,
             no_repeat_ngram_size=no_repeat_ngram_size,
         )
+        logits_processor = self._build_logits_processor(
+            tokenizer=self.processor.tokenizer,
+            content_no_repeat_ngram_size=content_no_repeat_ngram_size,
+            content_no_repeat_decode_max_tokens=content_no_repeat_decode_max_tokens,
+            content_no_repeat_debug=content_no_repeat_debug,
+        )
 
         start_time = time.time()
 
@@ -270,7 +294,14 @@ class VibeVoiceASRBatchInference:
             set_global_seed(self.seed)
 
         with torch.no_grad():
-            output_ids = self.model.generate(**inputs, **generation_config)
+            if logits_processor is not None:
+                output_ids = self.model.generate(
+                    **inputs,
+                    **generation_config,
+                    logits_processor=logits_processor,
+                )
+            else:
+                output_ids = self.model.generate(**inputs, **generation_config)
 
         generation_time = time.time() - start_time
 
@@ -330,6 +361,9 @@ class VibeVoiceASRBatchInference:
         num_beams: int = 1,
         repetition_penalty: float = 1.0,
         no_repeat_ngram_size: int = 0,
+        content_no_repeat_ngram_size: int = 0,
+        content_no_repeat_decode_max_tokens: int = 2048,
+        content_no_repeat_debug: bool = False,
     ) -> List[Dict[str, Any]]:
         """
         Transcribe multiple audio files/arrays with automatic batching.
@@ -364,6 +398,9 @@ class VibeVoiceASRBatchInference:
                 num_beams=num_beams,
                 repetition_penalty=repetition_penalty,
                 no_repeat_ngram_size=no_repeat_ngram_size,
+                content_no_repeat_ngram_size=content_no_repeat_ngram_size,
+                content_no_repeat_decode_max_tokens=content_no_repeat_decode_max_tokens,
+                content_no_repeat_debug=content_no_repeat_debug,
             )
             all_results.extend(batch_results)
 
@@ -673,13 +710,13 @@ def main():
     parser.add_argument(
         "--num_beams",
         type=int,
-        default=3,
+        default=1,
         help="Number of beams for beam search. Use 1 for greedy/sampling",
     )
     parser.add_argument(
         "--repetition_penalty",
         type=float,
-        default=1.5,
+        default=1.2,
         help="Penalty for repeated tokens (>1.0 suppresses repetition)",
     )
     parser.add_argument(
@@ -688,6 +725,7 @@ def main():
         default=0,
         help="Disallow repeated n-grams of this size (0 disables)",
     )
+    ContentNoRepeatGenerationMixin.add_content_no_repeat_cli_args(parser)
     parser.add_argument(
         "--attn_implementation",
         type=str,
@@ -818,6 +856,9 @@ def main():
         num_beams=args.num_beams,
         repetition_penalty=args.repetition_penalty,
         no_repeat_ngram_size=args.no_repeat_ngram_size,
+        content_no_repeat_ngram_size=args.content_no_repeat_ngram_size,
+        content_no_repeat_decode_max_tokens=args.content_no_repeat_decode_max_tokens,
+        content_no_repeat_debug=args.content_no_repeat_debug,
     )
 
     # Print results
@@ -841,6 +882,9 @@ def main():
                     "num_beams": args.num_beams,
                     "repetition_penalty": args.repetition_penalty,
                     "no_repeat_ngram_size": args.no_repeat_ngram_size,
+                    "content_no_repeat_ngram_size": args.content_no_repeat_ngram_size,
+                    "content_no_repeat_decode_max_tokens": args.content_no_repeat_decode_max_tokens,
+                    "content_no_repeat_debug": args.content_no_repeat_debug,
                 },
                 "seed": args.seed,
                 "num_inputs": len(all_audio_inputs),
@@ -865,9 +909,7 @@ def main():
     if rttm_text:
         rttm_text += "\n"
     output_rttm_path.write_text(rttm_text, encoding="utf-8")
-    print(
-        f"Saved RTTM ({len(rttm_lines)} speaker segments) to: {output_rttm_path}"
-    )
+    print(f"Saved RTTM ({len(rttm_lines)} speaker segments) to: {output_rttm_path}")
 
     with open(output_args_path, "w", encoding="utf-8") as f:
         json.dump(

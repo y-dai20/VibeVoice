@@ -1,9 +1,10 @@
 
 #!/bin/bash
 
-uv run python demo/vibevoice_asr_inference_from_file.py \
+uv run python inference.py \
     --model_path microsoft/VibeVoice-ASR \
-    --output_json inference.json \
-    --output_rttm inference.rttm \
-    --num_beams 3 \
-    --audio_files ./test.webm
+    --num_beams 1 \
+    --content_no_repeat_ngram_size 10 \
+    --content_no_repeat_decode_max_tokens 1024 \
+    --content_no_repeat_debug \
+    --audio_files /home/yamad/workspace/tests/assets/youtube/イクサガミ_600.mp4
