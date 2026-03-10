@@ -22,6 +22,7 @@ Examples:
 """
 
 import argparse
+from datetime import datetime
 import json
 from pathlib import Path
 import random
@@ -145,6 +146,10 @@ def _default_rttm_path(
     if output_json:
         return Path(output_json).with_suffix(".rttm")
     return None
+
+
+def _batch_timestamp_dirname() -> str:
+    return datetime.now().strftime("%Y%m%d_%H%M%S")
 
 
 def _annotation_from_rttm_lines(lines: Iterable[str], uri: str) -> Annotation:
@@ -639,7 +644,7 @@ def main() -> None:
         "--output_dir",
         type=str,
         default="lora_inference_outputs",
-        help="Directory for batch per-file outputs",
+        help="Base directory for batch outputs; a timestamp subdirectory is created per run",
     )
     ContentNoRepeatGenerationMixin.add_content_no_repeat_cli_args(parser)
 
@@ -674,9 +679,10 @@ def main() -> None:
     aggregate_der_files = 0
     results: List[Dict[str, Any]] = []
 
-    output_dir = Path(args.output_dir).expanduser().resolve()
     batch_mode = args.input_dir is not None
+    output_dir = Path(args.output_dir).expanduser().resolve()
     if batch_mode:
+        output_dir = output_dir / _batch_timestamp_dirname()
         (output_dir / "json").mkdir(parents=True, exist_ok=True)
         (output_dir / "rttm").mkdir(parents=True, exist_ok=True)
 
