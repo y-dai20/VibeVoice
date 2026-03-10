@@ -338,11 +338,13 @@ def transcribe(
     if gen_config["do_sample"]:
         gen_config["temperature"] = temperature
         gen_config["top_p"] = 0.9
-    logits_processor = ContentNoRepeatGenerationMixin.build_content_no_repeat_logits_processor(
-        tokenizer=processor.tokenizer,
-        content_no_repeat_ngram_size=content_no_repeat_ngram_size,
-        content_no_repeat_decode_max_tokens=content_no_repeat_decode_max_tokens,
-        content_no_repeat_debug=content_no_repeat_debug,
+    logits_processor = (
+        ContentNoRepeatGenerationMixin.build_content_no_repeat_logits_processor(
+            tokenizer=processor.tokenizer,
+            content_no_repeat_ngram_size=content_no_repeat_ngram_size,
+            content_no_repeat_decode_max_tokens=content_no_repeat_decode_max_tokens,
+            content_no_repeat_debug=content_no_repeat_debug,
+        )
     )
 
     if seed is not None:
@@ -594,7 +596,7 @@ def main() -> None:
     parser.add_argument(
         "--max_new_tokens",
         type=int,
-        default=12000,
+        default=8192,
         help="Maximum tokens to generate",
     )
     parser.add_argument(

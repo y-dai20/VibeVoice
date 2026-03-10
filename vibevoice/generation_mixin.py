@@ -132,7 +132,7 @@ class ContentNoRepeatGenerationMixin:
         parser.add_argument(
             "--content_no_repeat_decode_max_tokens",
             type=int,
-            default=2048,
+            default=1024,
             help='How many recent tokens to decode when detecting the active JSON "Content" field',
         )
         parser.add_argument(

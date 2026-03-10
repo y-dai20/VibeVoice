@@ -10,6 +10,7 @@ HF_HUB_ENABLE_HF_TRANSFER=0 HF_HUB_DISABLE_XET=1 uv run torchrun --nproc_per_nod
   --model_path microsoft/VibeVoice-ASR \
   --tokenizer_path Qwen/Qwen2.5-1.5B \
   --data_dir ./toy_dataset \
+  --test_data_dir ./toy_dataset \
   --output_dir "${output_dir}" \
   --lora_r 4 \
   --lora_alpha 8 \

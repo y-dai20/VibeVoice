@@ -75,9 +75,7 @@ def _rttm_file_id(name: str) -> str:
     return cleaned or "audio"
 
 
-def _segments_to_rttm_lines(
-    segments: List[Dict[str, Any]], file_id: str
-) -> List[str]:
+def _segments_to_rttm_lines(segments: List[Dict[str, Any]], file_id: str) -> List[str]:
     lines: List[str] = []
     for seg in segments or []:
         speaker_id = seg.get("speaker_id")
@@ -100,7 +98,9 @@ def _segments_to_rttm_lines(
     return lines
 
 
-def _default_rttm_path(output_json: Optional[str], output_rttm: Optional[str]) -> Optional[Path]:
+def _default_rttm_path(
+    output_json: Optional[str], output_rttm: Optional[str]
+) -> Optional[Path]:
     if output_rttm:
         return Path(output_rttm)
     if output_json:
@@ -217,11 +217,13 @@ def transcribe(
     if gen_config["do_sample"]:
         gen_config["temperature"] = temperature
         gen_config["top_p"] = 0.9
-    logits_processor = ContentNoRepeatGenerationMixin.build_content_no_repeat_logits_processor(
-        tokenizer=processor.tokenizer,
-        content_no_repeat_ngram_size=content_no_repeat_ngram_size,
-        content_no_repeat_decode_max_tokens=content_no_repeat_decode_max_tokens,
-        content_no_repeat_debug=content_no_repeat_debug,
+    logits_processor = (
+        ContentNoRepeatGenerationMixin.build_content_no_repeat_logits_processor(
+            tokenizer=processor.tokenizer,
+            content_no_repeat_ngram_size=content_no_repeat_ngram_size,
+            content_no_repeat_decode_max_tokens=content_no_repeat_decode_max_tokens,
+            content_no_repeat_debug=content_no_repeat_debug,
+        )
     )
 
     # Generate
@@ -282,7 +284,7 @@ def main():
         help="Optional context info (e.g., 'Hotwords: Tea Brew, Aiden Host')",
     )
     parser.add_argument(
-        "--max_new_tokens", type=int, default=12000, help="Maximum tokens to generate"
+        "--max_new_tokens", type=int, default=8192, help="Maximum tokens to generate"
     )
     parser.add_argument(
         "--temperature",
