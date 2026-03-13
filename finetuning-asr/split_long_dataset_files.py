@@ -22,8 +22,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--stems",
         nargs="+",
-        required=True,
-        help="Base filenames to split, without extension.",
+        default=None,
+        help="Base filenames to split, without extension. "
+        "If omitted, --max-duration must be set and all qualifying files are split automatically.",
+    )
+    parser.add_argument(
+        "--max-duration",
+        type=float,
+        default=None,
+        help="Automatically split every JSON whose audio_duration exceeds this value (seconds).",
     )
     parser.add_argument(
         "--output-dir",
@@ -130,13 +137,18 @@ def split_pair(
     keep_originals: bool,
 ) -> None:
     json_path = dataset_dir / f"{stem}.json"
-    audio_path = dataset_dir / f"{stem}{audio_extension}"
     if not json_path.exists():
         raise FileNotFoundError(f"Missing JSON file: {json_path}")
+
+    payload = load_json(json_path)
+    # Prefer the extension recorded in the JSON's audio_path over the CLI default
+    recorded_ext = Path(payload.get("audio_path", "")).suffix
+    if recorded_ext:
+        audio_extension = recorded_ext
+    audio_path = dataset_dir / f"{stem}{audio_extension}"
     if not audio_path.exists():
         raise FileNotFoundError(f"Missing audio file: {audio_path}")
 
-    payload = load_json(json_path)
     duration = float(payload["audio_duration"])
     split_point = duration / 2.0
     part1_segments, part2_segments = split_segments(
@@ -171,6 +183,25 @@ def split_pair(
     )
 
 
+def find_long_stems(
+    dataset_dir: Path, max_duration: float, audio_extension: str
+) -> List[str]:
+    """Return stems of JSON files whose audio_duration exceeds max_duration."""
+    stems = []
+    for json_path in sorted(dataset_dir.glob("*.json")):
+        stem = json_path.stem
+        # Skip files that are already split parts
+        if stem.endswith("_part1") or stem.endswith("_part2"):
+            continue
+        try:
+            payload = load_json(json_path)
+        except Exception:
+            continue
+        if float(payload.get("audio_duration", 0)) > max_duration:
+            stems.append(stem)
+    return stems
+
+
 def main() -> None:
     args = parse_args()
     dataset_dir = args.dataset_dir.resolve()
@@ -180,7 +211,15 @@ def main() -> None:
     if not audio_extension.startswith("."):
         audio_extension = f".{audio_extension}"
 
-    for stem in args.stems:
+    if args.stems:
+        stems = args.stems
+    elif args.max_duration is not None:
+        stems = find_long_stems(dataset_dir, args.max_duration, audio_extension)
+        print(f"Found {len(stems)} file(s) exceeding {args.max_duration}s: {stems}")
+    else:
+        raise SystemExit("Either --stems or --max-duration must be specified.")
+
+    for stem in stems:
         split_pair(
             dataset_dir=dataset_dir,
             output_dir=output_dir,
