@@ -127,6 +127,46 @@ torchrun --nproc_per_node=4 lora_finetune.py \
 | `--use_customized_context` | True | Include customized_context from JSON as additional context |
 | `--max_audio_length` | None | Skip audio longer than this (seconds) |
 
+## Optuna Search
+
+`lora_finetune.py` can run Optuna directly when `--optuna_search_space` is provided.
+
+### Search Space File
+
+Use a JSON file with sections matching the training argument groups:
+
+- `model_args`
+- `data_args`
+- `lora_args`
+- `training_args`
+
+An example is provided at [`optuna_search_space.example.json`](./optuna_search_space.example.json).
+
+### Example
+
+Optimize against average DER on `--test_data_dir`:
+
+```bash
+torchrun --nproc_per_node=1 lora_finetune.py \
+    --model_path microsoft/VibeVoice-ASR \
+    --data_dir ./toy_dataset \
+    --test_data_dir ./toy_dataset \
+    --output_dir ./output \
+    --bf16 \
+    --report_to none \
+    --save_steps 50 \
+    --optuna_search_space ./optuna_search_space.example.json \
+    --optuna_n_trials 10 \
+    --optuna_metric test_der
+```
+
+Notes:
+
+- `--optuna_metric test_der` requires `--test_data_dir`, because the objective is taken from test inference DER summaries.
+- `--optuna_metric train_loss` can be used when you only want to optimize final training loss.
+- Each trial is written under `<output_dir>/optuna/trial_XXXX/` by default.
+- Study metadata is stored in `<output_dir>/optuna/optuna_study.db`, and the best result summary is written to `best_trial.json`.
+
 ## Inference with Fine-tuned Model
 
 ```bash

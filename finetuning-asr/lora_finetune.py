@@ -8,9 +8,10 @@ It uses PEFT (Parameter-Efficient Fine-Tuning) library for efficient training.
 
 import json
 import logging
+import copy
 from pathlib import Path
 from typing import List, Dict, Any, Optional, Tuple, Set
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 
 import torch
 import torch.nn as nn
@@ -122,6 +123,60 @@ class LoraArguments:
         default=32, metadata={"help": "LoRA alpha (scaling factor)"}
     )
     lora_dropout: float = field(default=0.05, metadata={"help": "LoRA dropout"})
+
+
+@dataclass
+class OptunaArguments:
+    """Arguments for Optuna hyperparameter search."""
+
+    optuna_search_space: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": (
+                "Path to JSON search-space file. If set, run Optuna instead of a single training run."
+            )
+        },
+    )
+    optuna_n_trials: int = field(
+        default=20, metadata={"help": "Number of Optuna trials"}
+    )
+    optuna_timeout: Optional[int] = field(
+        default=None,
+        metadata={"help": "Optional Optuna timeout in seconds"},
+    )
+    optuna_study_name: str = field(
+        default="vibevoice_asr_lora",
+        metadata={"help": "Optuna study name"},
+    )
+    optuna_storage: Optional[str] = field(
+        default=None,
+        metadata={"help": "Optuna storage URL. Defaults to sqlite under output_dir."},
+    )
+    optuna_metric: str = field(
+        default="test_der",
+        metadata={
+            "help": "Objective metric: test_der or train_loss",
+        },
+    )
+    optuna_direction: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": "Optimization direction. Defaults to minimize for current metrics."
+        },
+    )
+    optuna_output_dir: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": "Base output directory for Optuna trials. Defaults to <output_dir>/optuna."
+        },
+    )
+    optuna_sampler: str = field(
+        default="tpe",
+        metadata={"help": "Optuna sampler: tpe or random"},
+    )
+    optuna_seed: int = field(
+        default=42, metadata={"help": "Seed for the Optuna sampler and per-trial seeds"}
+    )
 
 
 @dataclass
@@ -753,6 +808,133 @@ class TestInferenceCallback(TrainerCallback):
         self.content_no_repeat_ngram_size = content_no_repeat_ngram_size
         self.content_no_repeat_decode_max_tokens = content_no_repeat_decode_max_tokens
         self.content_no_repeat_debug = content_no_repeat_debug
+        self.latest_der_summary: Optional[Dict[str, Any]] = None
+        self.best_average_der: Optional[float] = None
+        self.best_der_step: Optional[int] = None
+
+    def _run_and_persist(self, args, state, model) -> None:
+        logger.info(f"\n{'=' * 80}")
+        logger.info(f"Running test inference at step {state.global_step}")
+        logger.info(f"{'=' * 80}\n")
+
+        device = next(model.parameters()).device
+        results = run_inference_on_test_set(
+            model=model,
+            processor=self.processor,
+            test_dataset=self.test_dataset,
+            max_samples=self.max_test_samples,
+            device=str(device),
+            content_no_repeat_ngram_size=self.content_no_repeat_ngram_size,
+            content_no_repeat_decode_max_tokens=self.content_no_repeat_decode_max_tokens,
+            content_no_repeat_debug=self.content_no_repeat_debug,
+        )
+
+        results_dir = Path(args.output_dir) / "test_results"
+        results_dir.mkdir(parents=True, exist_ok=True)
+
+        results_file = results_dir / f"step_{state.global_step}_results.json"
+        with open(results_file, "w", encoding="utf-8") as f:
+            json.dump(results, f, ensure_ascii=False, indent=2)
+        logger.info(f"Saved test results to {results_file}")
+
+        rttm_dir = results_dir / f"step_{state.global_step}_rttm"
+        rttm_dir.mkdir(parents=True, exist_ok=True)
+
+        text_dir = results_dir / f"step_{state.global_step}_text"
+        text_dir.mkdir(parents=True, exist_ok=True)
+
+        for result in results:
+            file_id = Path(result["audio_path"]).stem
+
+            pred_rttm_file = rttm_dir / f"{file_id}_pred.rttm"
+            with open(pred_rttm_file, "w", encoding="utf-8") as f:
+                f.write(result["prediction_rttm"])
+
+            gt_rttm_file = rttm_dir / f"{file_id}_gt.rttm"
+            with open(gt_rttm_file, "w", encoding="utf-8") as f:
+                f.write(result["ground_truth_rttm"])
+
+            pred_text_file = text_dir / f"{file_id}_prediction.txt"
+            with open(pred_text_file, "w", encoding="utf-8") as f:
+                f.write(f"Audio: {result['audio_path']}\n")
+                f.write(f"Sample Index: {result['sample_idx']}\n")
+                f.write(
+                    f"Predicted Speaker Count: {result['predicted_speaker_count']}\n"
+                )
+                f.write(
+                    f"Ground Truth Speaker Count: {result['ground_truth_speaker_count']}\n"
+                )
+                f.write("=" * 80 + "\n")
+                f.write("PREDICTION:\n")
+                f.write(result["prediction"] + "\n\n")
+                f.write("=" * 80 + "\n")
+                f.write("GROUND TRUTH:\n")
+                f.write(result["ground_truth"] + "\n\n")
+                if result.get("der_metrics"):
+                    f.write("=" * 80 + "\n")
+                    f.write("DER METRICS:\n")
+                    f.write(f"  DER: {result['der_metrics']['DER']:.4f}\n")
+                    f.write(
+                        f"  Confusion: {result['der_metrics']['confusion']:.4f}\n"
+                    )
+                    f.write(
+                        f"  False Alarm: {result['der_metrics']['false_alarm']:.4f}\n"
+                    )
+                    f.write(
+                        f"  Missed Detection: {result['der_metrics']['missed_detection']:.4f}\n"
+                    )
+
+        logger.info(f"Saved RTTM files to {rttm_dir}")
+        logger.info(f"Saved text results to {text_dir}")
+
+        der_values = [r["der_metrics"] for r in results if r.get("der_metrics")]
+        if der_values:
+            avg_der = sum(m["DER"] for m in der_values) / len(der_values)
+            avg_confusion = sum(m["confusion"] for m in der_values) / len(der_values)
+            avg_false_alarm = sum(m["false_alarm"] for m in der_values) / len(
+                der_values
+            )
+            avg_missed = sum(m["missed_detection"] for m in der_values) / len(
+                der_values
+            )
+
+            logger.info(f"\n{'=' * 80}")
+            logger.info(f"Average DER Metrics (over {len(der_values)} samples):")
+            logger.info(f"  DER: {avg_der:.4f}")
+            logger.info(f"  Confusion: {avg_confusion:.4f}")
+            logger.info(f"  False Alarm: {avg_false_alarm:.4f}")
+            logger.info(f"  Missed Detection: {avg_missed:.4f}")
+            logger.info(f"{'=' * 80}\n")
+
+            der_summary = {
+                "step": state.global_step,
+                "num_samples": len(der_values),
+                "average_DER": avg_der,
+                "average_confusion": avg_confusion,
+                "average_false_alarm": avg_false_alarm,
+                "average_missed_detection": avg_missed,
+            }
+            self.latest_der_summary = der_summary
+            if self.best_average_der is None or avg_der < self.best_average_der:
+                self.best_average_der = avg_der
+                self.best_der_step = int(state.global_step)
+            der_summary["best_average_DER_so_far"] = self.best_average_der
+            der_summary["best_average_DER_step"] = self.best_der_step
+
+            der_summary_file = results_dir / f"step_{state.global_step}_der_summary.json"
+            with open(der_summary_file, "w", encoding="utf-8") as f:
+                json.dump(der_summary, f, ensure_ascii=False, indent=2)
+
+        if self.save_weights:
+            checkpoint_dir = Path(args.output_dir) / f"checkpoint-step-{state.global_step}"
+            checkpoint_dir.mkdir(parents=True, exist_ok=True)
+
+            model.save_pretrained(checkpoint_dir)
+            self.processor.save_pretrained(checkpoint_dir)
+
+            logger.info(f"Saved model weights to {checkpoint_dir}")
+
+        logger.info(f"\n{'=' * 80}\n")
 
     def on_step_end(self, args, state, control, model=None, **kwargs):
         """Called at the end of each training step."""
@@ -760,134 +942,15 @@ class TestInferenceCallback(TrainerCallback):
             return
 
         if state.global_step % self.eval_steps == 0 and state.global_step > 0:
-            logger.info(f"\n{'=' * 80}")
-            logger.info(f"Running test inference at step {state.global_step}")
-            logger.info(f"{'=' * 80}\n")
+            self._run_and_persist(args=args, state=state, model=model)
 
-            device = next(model.parameters()).device
-            results = run_inference_on_test_set(
-                model=model,
-                processor=self.processor,
-                test_dataset=self.test_dataset,
-                max_samples=self.max_test_samples,
-                device=str(device),
-                content_no_repeat_ngram_size=self.content_no_repeat_ngram_size,
-                content_no_repeat_decode_max_tokens=self.content_no_repeat_decode_max_tokens,
-                content_no_repeat_debug=self.content_no_repeat_debug,
-            )
-
-            results_dir = Path(args.output_dir) / "test_results"
-            results_dir.mkdir(parents=True, exist_ok=True)
-
-            # Save JSON results
-            results_file = results_dir / f"step_{state.global_step}_results.json"
-            with open(results_file, "w", encoding="utf-8") as f:
-                json.dump(results, f, ensure_ascii=False, indent=2)
-            logger.info(f"Saved test results to {results_file}")
-
-            # Save RTTM files and individual text results
-            rttm_dir = results_dir / f"step_{state.global_step}_rttm"
-            rttm_dir.mkdir(parents=True, exist_ok=True)
-
-            text_dir = results_dir / f"step_{state.global_step}_text"
-            text_dir.mkdir(parents=True, exist_ok=True)
-
-            for result in results:
-                file_id = Path(result["audio_path"]).stem
-
-                # Save prediction RTTM
-                pred_rttm_file = rttm_dir / f"{file_id}_pred.rttm"
-                with open(pred_rttm_file, "w", encoding="utf-8") as f:
-                    f.write(result["prediction_rttm"])
-
-                # Save ground truth RTTM
-                gt_rttm_file = rttm_dir / f"{file_id}_gt.rttm"
-                with open(gt_rttm_file, "w", encoding="utf-8") as f:
-                    f.write(result["ground_truth_rttm"])
-
-                # Save full prediction text
-                pred_text_file = text_dir / f"{file_id}_prediction.txt"
-                with open(pred_text_file, "w", encoding="utf-8") as f:
-                    f.write(f"Audio: {result['audio_path']}\n")
-                    f.write(f"Sample Index: {result['sample_idx']}\n")
-                    f.write(
-                        f"Predicted Speaker Count: {result['predicted_speaker_count']}\n"
-                    )
-                    f.write(
-                        f"Ground Truth Speaker Count: {result['ground_truth_speaker_count']}\n"
-                    )
-                    f.write("=" * 80 + "\n")
-                    f.write("PREDICTION:\n")
-                    f.write(result["prediction"] + "\n\n")
-                    f.write("=" * 80 + "\n")
-                    f.write("GROUND TRUTH:\n")
-                    f.write(result["ground_truth"] + "\n\n")
-                    if result.get("der_metrics"):
-                        f.write("=" * 80 + "\n")
-                        f.write("DER METRICS:\n")
-                        f.write(f"  DER: {result['der_metrics']['DER']:.4f}\n")
-                        f.write(
-                            f"  Confusion: {result['der_metrics']['confusion']:.4f}\n"
-                        )
-                        f.write(
-                            f"  False Alarm: {result['der_metrics']['false_alarm']:.4f}\n"
-                        )
-                        f.write(
-                            f"  Missed Detection: {result['der_metrics']['missed_detection']:.4f}\n"
-                        )
-
-            logger.info(f"Saved RTTM files to {rttm_dir}")
-            logger.info(f"Saved text results to {text_dir}")
-
-            # Calculate and log average DER metrics
-            der_values = [r["der_metrics"] for r in results if r.get("der_metrics")]
-            if der_values:
-                avg_der = sum(m["DER"] for m in der_values) / len(der_values)
-                avg_confusion = sum(m["confusion"] for m in der_values) / len(
-                    der_values
-                )
-                avg_false_alarm = sum(m["false_alarm"] for m in der_values) / len(
-                    der_values
-                )
-                avg_missed = sum(m["missed_detection"] for m in der_values) / len(
-                    der_values
-                )
-
-                logger.info(f"\n{'=' * 80}")
-                logger.info(f"Average DER Metrics (over {len(der_values)} samples):")
-                logger.info(f"  DER: {avg_der:.4f}")
-                logger.info(f"  Confusion: {avg_confusion:.4f}")
-                logger.info(f"  False Alarm: {avg_false_alarm:.4f}")
-                logger.info(f"  Missed Detection: {avg_missed:.4f}")
-                logger.info(f"{'=' * 80}\n")
-
-                # Save DER summary
-                der_summary = {
-                    "step": state.global_step,
-                    "num_samples": len(der_values),
-                    "average_DER": avg_der,
-                    "average_confusion": avg_confusion,
-                    "average_false_alarm": avg_false_alarm,
-                    "average_missed_detection": avg_missed,
-                }
-                der_summary_file = (
-                    results_dir / f"step_{state.global_step}_der_summary.json"
-                )
-                with open(der_summary_file, "w", encoding="utf-8") as f:
-                    json.dump(der_summary, f, ensure_ascii=False, indent=2)
-
-            if self.save_weights:
-                checkpoint_dir = (
-                    Path(args.output_dir) / f"checkpoint-step-{state.global_step}"
-                )
-                checkpoint_dir.mkdir(parents=True, exist_ok=True)
-
-                model.save_pretrained(checkpoint_dir)
-                self.processor.save_pretrained(checkpoint_dir)
-
-                logger.info(f"Saved model weights to {checkpoint_dir}")
-
-            logger.info(f"\n{'=' * 80}\n")
+    def on_train_end(self, args, state, control, model=None, **kwargs):
+        if self.test_dataset is None or model is None:
+            return
+        if state.global_step <= 0:
+            return
+        if self.eval_steps <= 0 or state.global_step % self.eval_steps != 0:
+            self._run_and_persist(args=args, state=state, model=model)
 
 
 class SafeTrainer(Trainer):
@@ -1117,7 +1180,7 @@ def train(
     lora_args: LoraArguments,
     training_args: TrainingArguments,
     gradient_checkpointing: bool = True,
-):
+) -> Dict[str, Any]:
     """
     Main training function for LoRA fine-tuning.
 
@@ -1223,6 +1286,7 @@ def train(
 
     # Create callback for test inference
     callbacks = []
+    test_callback: Optional[TestInferenceCallback] = None
     if test_dataset is not None:
         test_callback = TestInferenceCallback(
             test_dataset=test_dataset,
@@ -1288,26 +1352,261 @@ def train(
     processor.save_pretrained(training_args.output_dir)
 
     logger.info("Training complete!")
+    result_payload: Dict[str, Any] = {
+        "train_metrics": metrics,
+        "dataset_summary": dataset_summary,
+        "output_dir": training_args.output_dir,
+    }
+    if test_callback is not None:
+        result_payload["test_der_latest"] = test_callback.latest_der_summary
+        result_payload["test_der_best"] = (
+            {
+                "average_DER": test_callback.best_average_der,
+                "step": test_callback.best_der_step,
+            }
+            if test_callback.best_average_der is not None
+            else None
+        )
 
-    return model, processor
+    del trainer
+    del model
+    del processor
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    return result_payload
+
+
+def load_optuna_search_space(path: str) -> Dict[str, Any]:
+    with open(path, "r", encoding="utf-8") as f:
+        payload = json.load(f)
+    if not isinstance(payload, dict):
+        raise ValueError("Optuna search space root must be a JSON object.")
+    return payload
+
+
+def build_optuna_sampler(name: str, seed: int):
+    import optuna
+
+    if name == "random":
+        return optuna.samplers.RandomSampler(seed=seed)
+    if name == "tpe":
+        return optuna.samplers.TPESampler(seed=seed)
+    raise ValueError(f"Unsupported optuna sampler: {name}")
+
+
+def suggest_optuna_value(trial, name: str, spec: Dict[str, Any]) -> Any:
+    kind = str(spec.get("type", "")).lower()
+    if kind == "float":
+        low = float(spec["low"])
+        high = float(spec["high"])
+        step = spec.get("step")
+        log = bool(spec.get("log", False))
+        if step is None:
+            return trial.suggest_float(name, low, high, log=log)
+        return trial.suggest_float(name, low, high, step=float(step), log=log)
+    if kind == "int":
+        return trial.suggest_int(
+            name,
+            int(spec["low"]),
+            int(spec["high"]),
+            step=int(spec.get("step", 1)),
+            log=bool(spec.get("log", False)),
+        )
+    if kind in {"categorical", "choice", "choices"}:
+        choices = spec.get("choices")
+        if not isinstance(choices, list) or not choices:
+            raise ValueError(f"{name}: choices must be a non-empty list.")
+        return trial.suggest_categorical(name, choices)
+    if kind == "bool":
+        return trial.suggest_categorical(name, [False, True])
+    raise ValueError(f"{name}: unsupported search space type {kind!r}")
+
+
+def sample_optuna_overrides(trial, search_space: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+    allowed_sections = {"model_args", "data_args", "lora_args", "training_args"}
+    overrides: Dict[str, Dict[str, Any]] = {}
+    for section, section_spec in search_space.items():
+        if section not in allowed_sections:
+            raise ValueError(f"Unsupported search-space section: {section}")
+        if not isinstance(section_spec, dict):
+            raise ValueError(f"Search-space section must be an object: {section}")
+        section_overrides: Dict[str, Any] = {}
+        for key, spec in section_spec.items():
+            if not isinstance(spec, dict):
+                raise ValueError(f"{section}.{key}: spec must be an object.")
+            section_overrides[key] = suggest_optuna_value(trial, f"{section}.{key}", spec)
+        if section_overrides:
+            overrides[section] = section_overrides
+    return overrides
+
+
+def resolve_optuna_direction(metric: str, direction: Optional[str]) -> str:
+    if direction is not None:
+        if direction not in {"minimize", "maximize"}:
+            raise ValueError("optuna_direction must be 'minimize' or 'maximize'.")
+        return direction
+    if metric in {"test_der", "train_loss"}:
+        return "minimize"
+    raise ValueError(f"Unsupported optuna metric: {metric}")
+
+
+def apply_dataclass_overrides(instance, overrides: Dict[str, Any]):
+    valid_fields = set(instance.__dataclass_fields__.keys())
+    unknown = sorted(set(overrides) - valid_fields)
+    if unknown:
+        raise ValueError(
+            f"Unknown override fields for {type(instance).__name__}: {unknown}"
+        )
+    return replace(instance, **overrides)
+
+
+def extract_optuna_metric(
+    metric_name: str,
+    train_result: Dict[str, Any],
+) -> float:
+    if metric_name == "train_loss":
+        value = train_result.get("train_metrics", {}).get("train_loss")
+        if value is None:
+            raise RuntimeError("train_loss was not found in training metrics.")
+        return float(value)
+    if metric_name == "test_der":
+        best_payload = train_result.get("test_der_best")
+        if not best_payload or best_payload.get("average_DER") is None:
+            raise RuntimeError(
+                "test_der metric requires test_data_dir and at least one successful test inference pass."
+            )
+        return float(best_payload["average_DER"])
+    raise ValueError(f"Unsupported optuna metric: {metric_name}")
+
+
+def run_optuna(
+    model_args: ModelArguments,
+    data_args: DataArguments,
+    lora_args: LoraArguments,
+    training_args: TrainingArguments,
+    optuna_args: OptunaArguments,
+    gradient_checkpointing: bool = True,
+) -> None:
+    import optuna
+
+    if optuna_args.optuna_search_space is None:
+        raise ValueError("optuna_search_space is required to run Optuna.")
+
+    metric_name = optuna_args.optuna_metric
+    direction = resolve_optuna_direction(metric_name, optuna_args.optuna_direction)
+    base_output_dir = Path(
+        optuna_args.optuna_output_dir
+        or (Path(training_args.output_dir).resolve() / "optuna")
+    ).resolve()
+    base_output_dir.mkdir(parents=True, exist_ok=True)
+
+    storage = optuna_args.optuna_storage
+    if storage is None:
+        storage = f"sqlite:///{(base_output_dir / 'optuna_study.db').resolve()}"
+
+    search_space = load_optuna_search_space(optuna_args.optuna_search_space)
+    study = optuna.create_study(
+        study_name=optuna_args.optuna_study_name,
+        storage=storage,
+        load_if_exists=True,
+        direction=direction,
+        sampler=build_optuna_sampler(optuna_args.optuna_sampler, optuna_args.optuna_seed),
+    )
+
+    logger.info(
+        "Starting Optuna study name=%s metric=%s direction=%s trials=%d storage=%s",
+        optuna_args.optuna_study_name,
+        metric_name,
+        direction,
+        optuna_args.optuna_n_trials,
+        storage,
+    )
+
+    def objective(trial) -> float:
+        overrides = sample_optuna_overrides(trial, search_space)
+        trial_output_dir = base_output_dir / f"trial_{trial.number:04d}"
+        trial_output_dir.mkdir(parents=True, exist_ok=True)
+
+        local_model_args = apply_dataclass_overrides(
+            copy.deepcopy(model_args), overrides.get("model_args", {})
+        )
+        local_data_args = apply_dataclass_overrides(
+            copy.deepcopy(data_args), overrides.get("data_args", {})
+        )
+        local_lora_args = apply_dataclass_overrides(
+            copy.deepcopy(lora_args), overrides.get("lora_args", {})
+        )
+        local_training_args = apply_dataclass_overrides(
+            copy.deepcopy(training_args), overrides.get("training_args", {})
+        )
+        local_training_args = replace(
+            local_training_args,
+            output_dir=str(trial_output_dir),
+            seed=int(optuna_args.optuna_seed + trial.number),
+        )
+
+        trial.set_user_attr("output_dir", str(trial_output_dir))
+        trial.set_user_attr("overrides", overrides)
+
+        result = train(
+            model_args=local_model_args,
+            data_args=local_data_args,
+            lora_args=local_lora_args,
+            training_args=local_training_args,
+            gradient_checkpointing=gradient_checkpointing,
+        )
+        objective_value = extract_optuna_metric(metric_name, result)
+        trial.set_user_attr("objective_value", objective_value)
+        return objective_value
+
+    study.optimize(
+        objective,
+        n_trials=optuna_args.optuna_n_trials,
+        timeout=optuna_args.optuna_timeout,
+    )
+
+    summary = {
+        "study_name": study.study_name,
+        "metric": metric_name,
+        "direction": direction,
+        "storage": storage,
+        "best_trial": study.best_trial.number,
+        "best_value": study.best_value,
+        "best_params": study.best_params,
+        "best_user_attrs": study.best_trial.user_attrs,
+    }
+    summary_path = base_output_dir / "best_trial.json"
+    with open(summary_path, "w", encoding="utf-8") as f:
+        json.dump(summary, f, ensure_ascii=False, indent=2)
+    logger.info("Saved Optuna summary to %s", summary_path)
+    logger.info("Best trial summary:\n%s", json.dumps(summary, ensure_ascii=False, indent=2))
 
 
 def main():
     # Use HfArgumentParser to parse all argument dataclasses
     parser = HfArgumentParser(
-        (ModelArguments, DataArguments, LoraArguments, TrainingArguments)
+        (ModelArguments, DataArguments, LoraArguments, TrainingArguments, OptunaArguments)
     )
-    model_args, data_args, lora_args, training_args = (
+    model_args, data_args, lora_args, training_args, optuna_args = (
         parser.parse_args_into_dataclasses()
     )
 
-    # Run training
-    train(
-        model_args=model_args,
-        data_args=data_args,
-        lora_args=lora_args,
-        training_args=training_args,
-    )
+    if optuna_args.optuna_search_space:
+        run_optuna(
+            model_args=model_args,
+            data_args=data_args,
+            lora_args=lora_args,
+            training_args=training_args,
+            optuna_args=optuna_args,
+        )
+    else:
+        train(
+            model_args=model_args,
+            data_args=data_args,
+            lora_args=lora_args,
+            training_args=training_args,
+        )
 
 
 if __name__ == "__main__":
