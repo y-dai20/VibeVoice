@@ -561,6 +561,22 @@ def calculate_der(
         return None
 
 
+def count_unique_speakers_in_rttm(rttm_str: str) -> int:
+    speakers = set()
+
+    for line in rttm_str.strip().split("\n"):
+        if not line or not line.startswith("SPEAKER"):
+            continue
+
+        parts = line.split()
+        if len(parts) < 8:
+            continue
+
+        speakers.add(parts[7])
+
+    return len(speakers)
+
+
 def run_inference_on_test_set(
     model: nn.Module,
     processor: VibeVoiceASRProcessor,
@@ -586,11 +602,13 @@ def run_inference_on_test_set(
     """
     model.eval()
     results = []
-    logits_processor = ContentNoRepeatGenerationMixin.build_content_no_repeat_logits_processor(
-        tokenizer=processor.tokenizer,
-        content_no_repeat_ngram_size=content_no_repeat_ngram_size,
-        content_no_repeat_decode_max_tokens=content_no_repeat_decode_max_tokens,
-        content_no_repeat_debug=content_no_repeat_debug,
+    logits_processor = (
+        ContentNoRepeatGenerationMixin.build_content_no_repeat_logits_processor(
+            tokenizer=processor.tokenizer,
+            content_no_repeat_ngram_size=content_no_repeat_ngram_size,
+            content_no_repeat_decode_max_tokens=content_no_repeat_decode_max_tokens,
+            content_no_repeat_debug=content_no_repeat_debug,
+        )
     )
 
     num_samples = min(max_samples, len(test_dataset))
@@ -662,6 +680,8 @@ def run_inference_on_test_set(
                 file_id = Path(audio_path).stem
                 pred_rttm = json_to_rttm(predicted_text, file_id)
                 gt_rttm = json_to_rttm(ground_truth, file_id)
+                predicted_speaker_count = count_unique_speakers_in_rttm(pred_rttm)
+                ground_truth_speaker_count = count_unique_speakers_in_rttm(gt_rttm)
 
                 # Calculate DER
                 der_metrics = calculate_der(gt_rttm, pred_rttm, uri=file_id)
@@ -673,6 +693,8 @@ def run_inference_on_test_set(
                     "ground_truth": ground_truth,
                     "prediction_rttm": pred_rttm,
                     "ground_truth_rttm": gt_rttm,
+                    "predicted_speaker_count": predicted_speaker_count,
+                    "ground_truth_speaker_count": ground_truth_speaker_count,
                     "der_metrics": der_metrics,
                 }
                 results.append(result)
@@ -681,6 +703,9 @@ def run_inference_on_test_set(
                 logger.info(f"  Audio: {audio_path}")
                 logger.info(f"  Prediction (full):\n{predicted_text[:100]}")
                 logger.info(f"  Ground Truth (full):\n{ground_truth[:100]}")
+                logger.info(
+                    f"  Speaker count: predicted={predicted_speaker_count}, ground_truth={ground_truth_speaker_count}"
+                )
                 if der_metrics:
                     logger.info(
                         f"  DER: {der_metrics['DER']:.4f} (confusion: {der_metrics['confusion']:.4f}, "
@@ -706,8 +731,8 @@ class TestInferenceCallback(TrainerCallback):
         eval_steps: int = 100,
         max_test_samples: int = 5,
         save_weights: bool = True,
-        content_no_repeat_ngram_size: int = 0,
-        content_no_repeat_decode_max_tokens: int = 2048,
+        content_no_repeat_ngram_size: int = 3,
+        content_no_repeat_decode_max_tokens: int = 1024,
         content_no_repeat_debug: bool = False,
     ):
         """
@@ -785,6 +810,12 @@ class TestInferenceCallback(TrainerCallback):
                 with open(pred_text_file, "w", encoding="utf-8") as f:
                     f.write(f"Audio: {result['audio_path']}\n")
                     f.write(f"Sample Index: {result['sample_idx']}\n")
+                    f.write(
+                        f"Predicted Speaker Count: {result['predicted_speaker_count']}\n"
+                    )
+                    f.write(
+                        f"Ground Truth Speaker Count: {result['ground_truth_speaker_count']}\n"
+                    )
                     f.write("=" * 80 + "\n")
                     f.write("PREDICTION:\n")
                     f.write(result["prediction"] + "\n\n")
