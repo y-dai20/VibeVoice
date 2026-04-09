@@ -32,8 +32,8 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 import numpy as np
 import torch
 from peft import PeftModel
-from pyannote.core import Annotation, Segment
 from pyannote.metrics.diarization import DiarizationErrorRate
+from utils import annotation_from_rttm_lines as _annotation_from_rttm_lines
 
 from vibevoice.generation_mixin import ContentNoRepeatGenerationMixin
 from vibevoice.modular.modeling_vibevoice_asr import (
@@ -151,24 +151,6 @@ def _default_rttm_path(
 def _batch_timestamp_dirname() -> str:
     return datetime.now().strftime("%Y%m%d_%H%M%S")
 
-
-def _annotation_from_rttm_lines(lines: Iterable[str], uri: str) -> Annotation:
-    annotation = Annotation(uri=uri)
-    for line_no, line in enumerate(lines, start=1):
-        raw = line.strip()
-        if not raw or raw.startswith("#"):
-            continue
-        parts = raw.split()
-        if len(parts) < 8 or parts[0] != "SPEAKER":
-            continue
-        start = float(parts[3])
-        duration = float(parts[4])
-        speaker = parts[7]
-        if duration <= 0:
-            continue
-        track = f"{speaker}@{line_no}"
-        annotation[Segment(start, start + duration), track] = speaker
-    return annotation
 
 
 def _load_rttm_lines(path: Path) -> List[str]:

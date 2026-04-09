@@ -36,8 +36,8 @@ from vibevoice.modular.modeling_vibevoice_asr import (
     VibeVoiceASRForConditionalGeneration,
 )
 from vibevoice.processor.vibevoice_asr_processor import VibeVoiceASRProcessor
-from pyannote.core import Annotation, Segment
 from pyannote.metrics.diarization import DiarizationErrorRate
+from utils import annotation_from_rttm_string as rttm_to_annotation
 
 # Setup logging
 logging.basicConfig(
@@ -583,36 +583,6 @@ def json_to_rttm(json_str: str, file_id: str = "audio") -> str:
 
     return "\n".join(rttm_lines)
 
-
-def rttm_to_annotation(rttm_str: str, uri: str = "audio") -> Optional[Annotation]:
-    """
-    Convert RTTM string to pyannote Annotation object.
-
-    Args:
-        rttm_str: RTTM formatted string
-        uri: URI for the annotation
-
-    Returns:
-        Annotation object or None if pyannote is not available
-    """
-    annotation = Annotation(uri=uri)
-
-    for line in rttm_str.strip().split("\n"):
-        if not line or not line.startswith("SPEAKER"):
-            continue
-
-        parts = line.split()
-        if len(parts) < 9:
-            continue
-
-        start = float(parts[3])
-        duration = float(parts[4])
-        speaker = parts[7]
-
-        segment = Segment(start, start + duration)
-        annotation[segment] = speaker
-
-    return annotation
 
 
 def calculate_der(
