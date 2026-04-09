@@ -3,6 +3,12 @@
 from typing import Iterable
 
 from pyannote.core import Annotation, Segment
+from vibevoice.utils import (
+    canonicalize_segment_items,
+    extract_json_payload,
+    normalize_generated_text,
+    parse_structured_generation,
+)
 
 
 def annotation_from_rttm_lines(lines: Iterable[str], uri: str = "audio") -> Annotation:

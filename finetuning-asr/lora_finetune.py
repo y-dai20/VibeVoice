@@ -36,6 +36,7 @@ from vibevoice.modular.modeling_vibevoice_asr import (
     VibeVoiceASRForConditionalGeneration,
 )
 from vibevoice.processor.vibevoice_asr_processor import VibeVoiceASRProcessor
+from vibevoice.utils import parse_structured_generation
 from pyannote.metrics.diarization import DiarizationErrorRate
 from utils import annotation_from_rttm_string as rttm_to_annotation
 
@@ -559,24 +560,20 @@ def json_to_rttm(json_str: str, file_id: str = "audio") -> str:
     Returns:
         RTTM formatted string
     """
-    # Extract JSON array from text that may contain chat template artifacts
-    json_str = extract_json_array(json_str)
-
-    try:
-        segments = json.loads(json_str)
-    except json.JSONDecodeError:
+    segments = parse_structured_generation(json_str)
+    if not segments:
         logger.warning(f"Failed to parse JSON: {json_str[:100]}...")
         return ""
 
     rttm_lines = []
     for seg in segments:
-        if any(key not in seg for key in ("Start", "End", "Speaker")):
+        if any(key not in seg for key in ("start_time", "end_time", "speaker_id")):
             continue
 
-        start = seg["Start"]
-        end = seg["End"]
+        start = seg["start_time"]
+        end = seg["end_time"]
         duration = end - start
-        speaker = seg["Speaker"]
+        speaker = seg["speaker_id"]
 
         rttm_line = f"SPEAKER {file_id} 1 {start:.3f} {duration:.3f} <NA> <NA> speaker_{speaker} <NA> <NA>"
         rttm_lines.append(rttm_line)

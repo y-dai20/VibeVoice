@@ -14,7 +14,6 @@ from pathlib import Path
 import argparse
 import time
 import json
-import re
 from datetime import datetime
 import sys
 from typing import List, Dict, Any, Optional
@@ -24,6 +23,7 @@ from vibevoice.modular.modeling_vibevoice_asr import (
 )
 from vibevoice.generation_mixin import ContentNoRepeatGenerationMixin
 from vibevoice.processor.vibevoice_asr_processor import VibeVoiceASRProcessor
+from vibevoice.utils import normalize_generated_text, parse_structured_generation
 
 
 def set_global_seed(seed: int) -> None:
@@ -89,86 +89,14 @@ class VibeVoiceASRBatchInference:
 
         print(f"Model loaded successfully on {self.device}")
 
-    @staticmethod
-    def _normalize_generated_text(text: str) -> str:
-        normalized = (text or "").strip()
-        normalized = re.sub(
-            r"^\s*assistant\s*[:\n\r]*", "", normalized, flags=re.IGNORECASE
-        )
-        return normalized.strip()
-
-    @staticmethod
-    def _extract_json_payload(text: str) -> Optional[str]:
-        if not text:
-            return None
-        if "```json" in text:
-            json_start = text.find("```json") + 7
-            json_end = text.find("```", json_start)
-            if json_end > json_start:
-                return text[json_start:json_end].strip()
-
-        json_start = text.find("[")
-        if json_start == -1:
-            json_start = text.find("{")
-        if json_start == -1:
-            return None
-
-        bracket_count = 0
-        json_end = -1
-        for i in range(json_start, len(text)):
-            if text[i] in "[{":
-                bracket_count += 1
-            elif text[i] in "]}":
-                bracket_count -= 1
-                if bracket_count == 0:
-                    json_end = i + 1
-                    break
-        if json_end == -1:
-            return None
-        return text[json_start:json_end]
-
     def _parse_segments_with_fallback(self, text: str) -> List[Dict[str, Any]]:
-        try:
-            parsed = self.processor.post_process_transcription(text)
-            if parsed:
-                return parsed
-        except Exception as e:
-            print(f"Warning: Failed to parse structured output: {e}")
-
-        normalized = self._normalize_generated_text(text)
-        payload = self._extract_json_payload(normalized)
-        if not payload:
-            return []
-
-        try:
-            result = json.loads(payload)
-            if isinstance(result, dict):
-                result = [result]
-            if not isinstance(result, list):
-                return []
-        except Exception:
-            return []
-
-        key_mapping = {
-            "Start time": "start_time",
-            "Start": "start_time",
-            "End time": "end_time",
-            "End": "end_time",
-            "Speaker ID": "speaker_id",
-            "Speaker": "speaker_id",
-            "Content": "text",
-        }
-        cleaned_result: List[Dict[str, Any]] = []
-        for item in result:
-            if not isinstance(item, dict):
-                continue
-            cleaned_item: Dict[str, Any] = {}
-            for key, mapped_key in key_mapping.items():
-                if key in item:
-                    cleaned_item[mapped_key] = item[key]
-            if cleaned_item:
-                cleaned_result.append(cleaned_item)
-        return cleaned_result
+        segments = parse_structured_generation(
+            text,
+            structured_parser=self.processor.post_process_transcription,
+        )
+        if not segments and (text or "").strip():
+            print("Warning: Failed to parse structured output")
+        return segments
 
     def _prepare_generation_config(
         self,
@@ -324,7 +252,7 @@ class VibeVoiceASRBatchInference:
             generated_text = self.processor.decode(
                 generated_ids, skip_special_tokens=True
             )
-            normalized_text = self._normalize_generated_text(generated_text)
+            normalized_text = normalize_generated_text(generated_text)
             transcription_segments = self._parse_segments_with_fallback(generated_text)
 
             # Get file name based on input type

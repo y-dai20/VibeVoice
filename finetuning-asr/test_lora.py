@@ -40,6 +40,7 @@ from vibevoice.modular.modeling_vibevoice_asr import (
     VibeVoiceASRForConditionalGeneration,
 )
 from vibevoice.processor.vibevoice_asr_processor import VibeVoiceASRProcessor
+from vibevoice.utils import parse_structured_generation
 
 
 MEDIA_SUFFIXES = {
@@ -350,15 +351,12 @@ def transcribe(
     input_length = inputs["input_ids"].shape[1]
     generated_ids = output_ids[0, input_length:]
     generated_text = processor.decode(generated_ids, skip_special_tokens=True)
-    cleaned_text = generated_text.strip()
-    if cleaned_text.lower().startswith("assistant"):
-        cleaned_text = cleaned_text.split("\n", 1)[-1].strip()
-
-    try:
-        segments = processor.post_process_transcription(cleaned_text)
-    except Exception as exc:
-        print(f"Warning: Failed to parse structured output: {exc}")
-        segments = []
+    segments = parse_structured_generation(
+        generated_text,
+        structured_parser=processor.post_process_transcription,
+    )
+    if not segments and (generated_text or "").strip():
+        print("Warning: Failed to parse structured output")
 
     return {
         "raw_text": generated_text,
