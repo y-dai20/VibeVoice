@@ -377,8 +377,13 @@ def main():
     if args.output_json:
         output_path = Path(args.output_json)
         output_path.parent.mkdir(parents=True, exist_ok=True)
+        audio_abs = Path(args.audio_file).resolve()
+        try:
+            audio_rel = audio_abs.relative_to(output_path.parent.resolve())
+        except ValueError:
+            audio_rel = audio_abs
         payload = {
-            "audio_file": args.audio_file,
+            "audio_file": str(audio_rel),
             "context_info": args.context_info,
             "generation_config": {
                 "max_new_tokens": args.max_new_tokens,

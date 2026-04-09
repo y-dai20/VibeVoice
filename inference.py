@@ -676,7 +676,7 @@ def main():
     parser.add_argument(
         "--batch_size",
         type=int,
-        default=2,
+        default=1,
         help="Batch size for processing multiple files",
     )
     parser.add_argument(

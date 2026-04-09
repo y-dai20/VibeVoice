@@ -9,13 +9,14 @@ It uses PEFT (Parameter-Efficient Fine-Tuning) library for efficient training.
 import json
 import logging
 import copy
+import os
 from pathlib import Path
 from typing import List, Dict, Any, Optional, Tuple, Set
 from dataclasses import asdict, dataclass, field, replace
 
 import torch
 import torch.nn as nn
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, Subset
 import numpy as np
 
 from transformers import (
@@ -47,6 +48,18 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+def uses_wandb(report_to: Any) -> bool:
+    if report_to is None:
+        return False
+    if isinstance(report_to, str):
+        return report_to.lower() == "wandb" or "wandb" in {
+            item.strip().lower() for item in report_to.split(",") if item.strip()
+        }
+    if isinstance(report_to, (list, tuple, set)):
+        return any(str(item).strip().lower() == "wandb" for item in report_to)
+    return False
+
+
 @dataclass
 class ModelArguments:
     """Arguments for model configuration."""
@@ -76,6 +89,18 @@ class DataArguments:
         default=None,
         metadata={
             "help": "Directory containing test data for periodic inference evaluation"
+        },
+    )
+    validation_data_dir: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": "Directory containing validation data for per-epoch/step evaluation"
+        },
+    )
+    validation_split_ratio: float = field(
+        default=0.0,
+        metadata={
+            "help": "If validation_data_dir is not set, reserve this fraction of data_dir for validation"
         },
     )
     max_audio_length: Optional[float] = field(
@@ -123,6 +148,18 @@ class LoraArguments:
         default=32, metadata={"help": "LoRA alpha (scaling factor)"}
     )
     lora_dropout: float = field(default=0.05, metadata={"help": "LoRA dropout"})
+    lora_acoustic_tokenizer: bool = field(
+        default=False,
+        metadata={
+            "help": "Also apply LoRA to supported layers inside the acoustic tokenizer"
+        },
+    )
+    lora_semantic_tokenizer: bool = field(
+        default=False,
+        metadata={
+            "help": "Also apply LoRA to supported layers inside the semantic tokenizer"
+        },
+    )
 
 
 @dataclass
@@ -632,6 +669,43 @@ def count_unique_speakers_in_rttm(rttm_str: str) -> int:
     return len(speakers)
 
 
+def _levenshtein_distance(reference: str, hypothesis: str) -> int:
+    if reference == hypothesis:
+        return 0
+    if not reference:
+        return len(hypothesis)
+    if not hypothesis:
+        return len(reference)
+
+    previous = list(range(len(hypothesis) + 1))
+    for i, ref_char in enumerate(reference, start=1):
+        current = [i]
+        for j, hyp_char in enumerate(hypothesis, start=1):
+            substitution_cost = 0 if ref_char == hyp_char else 1
+            current.append(
+                min(
+                    previous[j] + 1,
+                    current[j - 1] + 1,
+                    previous[j - 1] + substitution_cost,
+                )
+            )
+        previous = current
+    return previous[-1]
+
+
+def calculate_cer(reference: str, hypothesis: str) -> Dict[str, Any]:
+    reference = reference or ""
+    hypothesis = hypothesis or ""
+    distance = _levenshtein_distance(reference, hypothesis)
+    reference_length = max(len(reference), 1)
+    return {
+        "CER": distance / reference_length,
+        "edit_distance": distance,
+        "reference_length": len(reference),
+        "hypothesis_length": len(hypothesis),
+    }
+
+
 def run_inference_on_test_set(
     model: nn.Module,
     processor: VibeVoiceASRProcessor,
@@ -740,6 +814,7 @@ def run_inference_on_test_set(
 
                 # Calculate DER
                 der_metrics = calculate_der(gt_rttm, pred_rttm, uri=file_id)
+                cer_metrics = calculate_cer(ground_truth, predicted_text)
 
                 result = {
                     "sample_idx": idx,
@@ -751,6 +826,7 @@ def run_inference_on_test_set(
                     "predicted_speaker_count": predicted_speaker_count,
                     "ground_truth_speaker_count": ground_truth_speaker_count,
                     "der_metrics": der_metrics,
+                    "cer_metrics": cer_metrics,
                 }
                 results.append(result)
 
@@ -767,6 +843,11 @@ def run_inference_on_test_set(
                         f"false_alarm: {der_metrics['false_alarm']:.4f}, "
                         f"missed_detection: {der_metrics['missed_detection']:.4f})"
                     )
+                logger.info(
+                    f"  CER: {cer_metrics['CER']:.4f} "
+                    f"(edit_distance: {cer_metrics['edit_distance']}, "
+                    f"ref_len: {cer_metrics['reference_length']})"
+                )
 
             except Exception as e:
                 logger.warning(f"Error during inference on sample {idx}: {e}")
@@ -809,8 +890,11 @@ class TestInferenceCallback(TrainerCallback):
         self.content_no_repeat_decode_max_tokens = content_no_repeat_decode_max_tokens
         self.content_no_repeat_debug = content_no_repeat_debug
         self.latest_der_summary: Optional[Dict[str, Any]] = None
+        self.latest_cer_summary: Optional[Dict[str, Any]] = None
         self.best_average_der: Optional[float] = None
         self.best_der_step: Optional[int] = None
+        self.best_average_cer: Optional[float] = None
+        self.best_cer_step: Optional[int] = None
 
     def _run_and_persist(self, args, state, model) -> None:
         logger.info(f"\n{'=' * 80}")
@@ -874,14 +958,22 @@ class TestInferenceCallback(TrainerCallback):
                     f.write("=" * 80 + "\n")
                     f.write("DER METRICS:\n")
                     f.write(f"  DER: {result['der_metrics']['DER']:.4f}\n")
-                    f.write(
-                        f"  Confusion: {result['der_metrics']['confusion']:.4f}\n"
-                    )
+                    f.write(f"  Confusion: {result['der_metrics']['confusion']:.4f}\n")
                     f.write(
                         f"  False Alarm: {result['der_metrics']['false_alarm']:.4f}\n"
                     )
                     f.write(
                         f"  Missed Detection: {result['der_metrics']['missed_detection']:.4f}\n"
+                    )
+                if result.get("cer_metrics"):
+                    f.write("=" * 80 + "\n")
+                    f.write("CER METRICS:\n")
+                    f.write(f"  CER: {result['cer_metrics']['CER']:.4f}\n")
+                    f.write(
+                        f"  Edit Distance: {result['cer_metrics']['edit_distance']}\n"
+                    )
+                    f.write(
+                        f"  Reference Length: {result['cer_metrics']['reference_length']}\n"
                     )
 
         logger.info(f"Saved RTTM files to {rttm_dir}")
@@ -921,12 +1013,80 @@ class TestInferenceCallback(TrainerCallback):
             der_summary["best_average_DER_so_far"] = self.best_average_der
             der_summary["best_average_DER_step"] = self.best_der_step
 
-            der_summary_file = results_dir / f"step_{state.global_step}_der_summary.json"
+            der_summary_file = (
+                results_dir / f"step_{state.global_step}_der_summary.json"
+            )
             with open(der_summary_file, "w", encoding="utf-8") as f:
                 json.dump(der_summary, f, ensure_ascii=False, indent=2)
 
+        cer_values = [r["cer_metrics"] for r in results if r.get("cer_metrics")]
+        if cer_values:
+            avg_cer = sum(m["CER"] for m in cer_values) / len(cer_values)
+            avg_edit_distance = sum(m["edit_distance"] for m in cer_values) / len(
+                cer_values
+            )
+            avg_reference_length = sum(m["reference_length"] for m in cer_values) / len(
+                cer_values
+            )
+
+            logger.info(f"\n{'=' * 80}")
+            logger.info(f"Average CER Metrics (over {len(cer_values)} samples):")
+            logger.info(f"  CER: {avg_cer:.4f}")
+            logger.info(f"  Edit Distance: {avg_edit_distance:.2f}")
+            logger.info(f"  Reference Length: {avg_reference_length:.2f}")
+            logger.info(f"{'=' * 80}\n")
+
+            cer_summary = {
+                "step": state.global_step,
+                "num_samples": len(cer_values),
+                "average_CER": avg_cer,
+                "average_edit_distance": avg_edit_distance,
+                "average_reference_length": avg_reference_length,
+            }
+            self.latest_cer_summary = cer_summary
+            if self.best_average_cer is None or avg_cer < self.best_average_cer:
+                self.best_average_cer = avg_cer
+                self.best_cer_step = int(state.global_step)
+            cer_summary["best_average_CER_so_far"] = self.best_average_cer
+            cer_summary["best_average_CER_step"] = self.best_cer_step
+
+            cer_summary_file = (
+                results_dir / f"step_{state.global_step}_cer_summary.json"
+            )
+            with open(cer_summary_file, "w", encoding="utf-8") as f:
+                json.dump(cer_summary, f, ensure_ascii=False, indent=2)
+
+            if uses_wandb(args.report_to):
+                try:
+                    import wandb
+
+                    if wandb.run is not None:
+                        wandb_payload = {
+                            "test_cer": avg_cer,
+                            "test_cer_avg_edit_distance": avg_edit_distance,
+                            "test_cer_avg_reference_length": avg_reference_length,
+                        }
+                        if self.latest_der_summary is not None:
+                            wandb_payload["test_der"] = self.latest_der_summary[
+                                "average_DER"
+                            ]
+                            wandb_payload["test_der_confusion"] = (
+                                self.latest_der_summary["average_confusion"]
+                            )
+                            wandb_payload["test_der_false_alarm"] = (
+                                self.latest_der_summary["average_false_alarm"]
+                            )
+                            wandb_payload["test_der_missed_detection"] = (
+                                self.latest_der_summary["average_missed_detection"]
+                            )
+                        wandb.log(wandb_payload, step=state.global_step)
+                except Exception as e:
+                    logger.warning("Failed to log test CER/DER to wandb: %s", e)
+
         if self.save_weights:
-            checkpoint_dir = Path(args.output_dir) / f"checkpoint-step-{state.global_step}"
+            checkpoint_dir = (
+                Path(args.output_dir) / f"checkpoint-step-{state.global_step}"
+            )
             checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
             model.save_pretrained(checkpoint_dir)
@@ -1076,7 +1236,8 @@ def get_lora_config(
     Create LoRA configuration for VibeVoice ASR model.
 
     We apply LoRA to the language model's attention layers and MLP,
-    following common practices for LLM fine-tuning.
+    and also to the speech connectors that project acoustic/semantic
+    features into the language-model hidden space, plus the output head.
 
     Args:
         r: LoRA rank
@@ -1088,8 +1249,10 @@ def get_lora_config(
         LoraConfig object
     """
     if target_modules is None:
-        # Target Qwen2 attention and MLP layers
-        # These are the common targets for language model fine-tuning
+        # Target Qwen2 attention and MLP layers, plus the speech connectors
+        # and output head.
+        # Connector module names are kept fully qualified so we do not
+        # accidentally match unrelated fc1/fc2 layers elsewhere in the model.
         target_modules = [
             "q_proj",
             "k_proj",
@@ -1098,6 +1261,11 @@ def get_lora_config(
             "gate_proj",
             "up_proj",
             "down_proj",
+            # "acoustic_connector.fc1",
+            # "acoustic_connector.fc2",
+            # "semantic_connector.fc1",
+            # "semantic_connector.fc2",
+            # "lm_head",
         ]
 
     return LoraConfig(
@@ -1107,13 +1275,78 @@ def get_lora_config(
         lora_dropout=lora_dropout,
         bias="none",
         task_type=TaskType.CAUSAL_LM,
+        # use_dora=True
     )
+
+
+def resolve_lora_target_modules(
+    model: nn.Module,
+    base_target_modules: Optional[List[str]] = None,
+    include_acoustic_tokenizer: bool = False,
+    include_semantic_tokenizer: bool = False,
+    lora_rank: Optional[int] = None,
+) -> List[str]:
+    """
+    Build the final list of LoRA target modules for the loaded model.
+
+    Tokenizer LoRA targets are collected from exact module names so we can
+    safely include their nested Conv1d/Linear layers without broad suffix
+    matches that could affect unrelated parts of the model.
+    """
+    target_modules = list(base_target_modules or [])
+    tokenizer_prefixes: List[str] = []
+    if include_acoustic_tokenizer:
+        tokenizer_prefixes.append("model.acoustic_tokenizer.")
+    if include_semantic_tokenizer:
+        tokenizer_prefixes.append("model.semantic_tokenizer.")
+
+    if not tokenizer_prefixes:
+        return target_modules
+
+    supported_module_types = (nn.Linear, nn.Conv1d)
+    seen = set(target_modules)
+    tokenizer_targets: List[str] = []
+    skipped_grouped_convs: List[str] = []
+
+    for module_name, module in model.named_modules():
+        if not module_name.startswith(tuple(tokenizer_prefixes)):
+            continue
+        if not isinstance(module, supported_module_types):
+            continue
+        if isinstance(module, nn.Conv1d) and module.groups > 1:
+            if lora_rank is None or (lora_rank % module.groups != 0):
+                skipped_grouped_convs.append(
+                    f"{module_name} (groups={module.groups}, rank={lora_rank})"
+                )
+                continue
+        if module_name in seen:
+            continue
+        seen.add(module_name)
+        tokenizer_targets.append(module_name)
+
+    logger.info(
+        "Resolved %d tokenizer LoRA target modules (%d total targets)",
+        len(tokenizer_targets),
+        len(seen),
+    )
+    if tokenizer_targets:
+        logger.info("Tokenizer LoRA targets:\n%s", "\n".join(tokenizer_targets))
+    if skipped_grouped_convs:
+        logger.warning(
+            "Skipped %d grouped Conv1d tokenizer modules that are incompatible with the current LoRA rank:\n%s",
+            len(skipped_grouped_convs),
+            "\n".join(skipped_grouped_convs),
+        )
+
+    target_modules.extend(tokenizer_targets)
+    return target_modules
 
 
 def setup_model_for_training(
     model_path: str,
     tokenizer_path: str,
     lora_config: LoraConfig,
+    lora_args: Optional[LoraArguments] = None,
     device: str = "cuda",
     dtype: torch.dtype = torch.bfloat16,
     gradient_checkpointing: bool = True,
@@ -1151,11 +1384,23 @@ def setup_model_for_training(
     if device != "auto":
         model = model.to(device)
 
-    # Freeze speech tokenizers (we only want to fine-tune the language model)
-    for name, param in model.named_parameters():
-        if "acoustic_tokenizer" in name or "semantic_tokenizer" in name:
-            param.requires_grad = False
-            logger.debug(f"Frozen: {name}")
+    resolved_target_modules = resolve_lora_target_modules(
+        model,
+        base_target_modules=list(lora_config.target_modules or []),
+        include_acoustic_tokenizer=(
+            lora_args.lora_acoustic_tokenizer if lora_args is not None else False
+        ),
+        include_semantic_tokenizer=(
+            lora_args.lora_semantic_tokenizer if lora_args is not None else False
+        ),
+        lora_rank=lora_config.r,
+    )
+    lora_config = get_lora_config(
+        r=lora_config.r,
+        lora_alpha=lora_config.lora_alpha,
+        lora_dropout=lora_config.lora_dropout,
+        target_modules=resolved_target_modules,
+    )
 
     # Apply LoRA
     logger.info(
@@ -1165,6 +1410,9 @@ def setup_model_for_training(
 
     # Print trainable parameters
     model.print_trainable_parameters()
+
+    for name, param in model.named_parameters():
+        print(name, param.requires_grad)
 
     # Enable gradient checkpointing if requested
     if gradient_checkpointing:
@@ -1192,6 +1440,16 @@ def train(
         gradient_checkpointing: Whether to use gradient checkpointing
     """
     log_path = setup_output_logging(training_args.output_dir)
+    if uses_wandb(training_args.report_to):
+        if not training_args.run_name:
+            training_args.run_name = Path(training_args.output_dir).resolve().name
+        os.environ.setdefault("WANDB_NAME", training_args.run_name)
+        os.environ.setdefault("WANDB_NOTES", "VibeVoice ASR LoRA fine-tuning")
+        logger.info(
+            "Weights & Biases logging enabled: run_name=%s project=%s",
+            training_args.run_name,
+            os.environ.get("WANDB_PROJECT", "(wandb default)"),
+        )
     save_argument_snapshot(
         model_args=model_args,
         data_args=data_args,
@@ -1221,13 +1479,14 @@ def train(
         model_path=model_args.model_path,
         tokenizer_path=model_args.tokenizer_path,
         lora_config=lora_config,
+        lora_args=lora_args,
         device=device,
         dtype=dtype,
         gradient_checkpointing=gradient_checkpointing,
     )
 
     # Create dataset
-    train_dataset = VibeVoiceASRDataset(
+    full_train_dataset = VibeVoiceASRDataset(
         data_dir=data_args.data_dir,
         processor=processor,
         max_audio_length=data_args.max_audio_length,
@@ -1235,12 +1494,58 @@ def train(
         skip_error_samples=data_args.skip_error_samples,
     )
 
+    train_dataset = full_train_dataset
+    eval_dataset = None
+
     dataset_summary = {
         "train": {
             "data_dir": data_args.data_dir,
-            "num_samples": len(train_dataset),
+            "num_samples": len(full_train_dataset),
         }
     }
+
+    if data_args.validation_data_dir:
+        logger.info("Loading validation dataset from %s", data_args.validation_data_dir)
+        eval_dataset = VibeVoiceASRDataset(
+            data_dir=data_args.validation_data_dir,
+            processor=processor,
+            max_audio_length=data_args.max_audio_length,
+            use_customized_context=data_args.use_customized_context,
+            skip_error_samples=data_args.skip_error_samples,
+        )
+        dataset_summary["validation"] = {
+            "data_dir": data_args.validation_data_dir,
+            "num_samples": len(eval_dataset),
+        }
+    elif data_args.validation_split_ratio > 0:
+        if not 0.0 < data_args.validation_split_ratio < 1.0:
+            raise ValueError("validation_split_ratio must be between 0 and 1.")
+        dataset_size = len(full_train_dataset)
+        if dataset_size < 2:
+            raise ValueError(
+                "At least 2 samples are required to create a validation split."
+            )
+        val_size = max(1, int(round(dataset_size * data_args.validation_split_ratio)))
+        if val_size >= dataset_size:
+            val_size = dataset_size - 1
+        generator = torch.Generator().manual_seed(training_args.seed)
+        indices = torch.randperm(dataset_size, generator=generator).tolist()
+        val_indices = indices[:val_size]
+        train_indices = indices[val_size:]
+        train_dataset = Subset(full_train_dataset, train_indices)
+        eval_dataset = Subset(full_train_dataset, val_indices)
+        dataset_summary["train"]["num_samples"] = len(train_dataset)
+        dataset_summary["validation"] = {
+            "data_dir": data_args.data_dir,
+            "split_ratio": data_args.validation_split_ratio,
+            "num_samples": len(eval_dataset),
+        }
+        logger.info(
+            "Split dataset into train=%d and validation=%d using seed=%d",
+            len(train_dataset),
+            len(eval_dataset),
+            training_args.seed,
+        )
 
     # Create test dataset if test_data_dir is provided
     test_dataset = None
@@ -1271,6 +1576,8 @@ def train(
     if len(train_dataset) == 0:
         logger.error("No training samples found!")
         return
+    if eval_dataset is not None and len(eval_dataset) == 0:
+        raise ValueError("Validation dataset is empty.")
 
     # Create data collator
     data_collator = VibeVoiceASRDataCollator(
@@ -1283,6 +1590,27 @@ def train(
         0  # Audio loading can be tricky with multiprocessing
     )
     training_args.remove_unused_columns = False  # Keep all columns
+    if eval_dataset is not None:
+        training_args.do_eval = True
+        if training_args.per_device_eval_batch_size == 8:
+            training_args.per_device_eval_batch_size = (
+                training_args.per_device_train_batch_size
+            )
+        if getattr(training_args, "evaluation_strategy", "no") == "no":
+            training_args.evaluation_strategy = "steps"
+        if (
+            hasattr(training_args, "eval_strategy")
+            and getattr(training_args, "eval_strategy", "no") == "no"
+        ):
+            training_args.eval_strategy = "steps"
+        if training_args.eval_steps is None:
+            training_args.eval_steps = (
+                training_args.save_steps or training_args.logging_steps
+            )
+        if training_args.metric_for_best_model is None:
+            training_args.metric_for_best_model = "eval_loss"
+        if training_args.greater_is_better is None:
+            training_args.greater_is_better = False
 
     # Create callback for test inference
     callbacks = []
@@ -1306,6 +1634,7 @@ def train(
         model=model,
         args=training_args,
         train_dataset=train_dataset,
+        eval_dataset=eval_dataset,
         data_collator=data_collator,
         callbacks=callbacks,
     )
@@ -1313,6 +1642,8 @@ def train(
     # Train
     logger.info("Starting training...")
     logger.info(f"  Num samples = {len(train_dataset)}")
+    if eval_dataset is not None:
+        logger.info(f"  Num validation samples = {len(eval_dataset)}")
     logger.info(f"  Num epochs = {training_args.num_train_epochs}")
     logger.info(f"  Batch size = {training_args.per_device_train_batch_size}")
     logger.info(
@@ -1365,6 +1696,15 @@ def train(
                 "step": test_callback.best_der_step,
             }
             if test_callback.best_average_der is not None
+            else None
+        )
+        result_payload["test_cer_latest"] = test_callback.latest_cer_summary
+        result_payload["test_cer_best"] = (
+            {
+                "average_CER": test_callback.best_average_cer,
+                "step": test_callback.best_cer_step,
+            }
+            if test_callback.best_average_cer is not None
             else None
         )
 
@@ -1423,7 +1763,9 @@ def suggest_optuna_value(trial, name: str, spec: Dict[str, Any]) -> Any:
     raise ValueError(f"{name}: unsupported search space type {kind!r}")
 
 
-def sample_optuna_overrides(trial, search_space: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+def sample_optuna_overrides(
+    trial, search_space: Dict[str, Any]
+) -> Dict[str, Dict[str, Any]]:
     allowed_sections = {"model_args", "data_args", "lora_args", "training_args"}
     overrides: Dict[str, Dict[str, Any]] = {}
     for section, section_spec in search_space.items():
@@ -1435,7 +1777,9 @@ def sample_optuna_overrides(trial, search_space: Dict[str, Any]) -> Dict[str, Di
         for key, spec in section_spec.items():
             if not isinstance(spec, dict):
                 raise ValueError(f"{section}.{key}: spec must be an object.")
-            section_overrides[key] = suggest_optuna_value(trial, f"{section}.{key}", spec)
+            section_overrides[key] = suggest_optuna_value(
+                trial, f"{section}.{key}", spec
+            )
         if section_overrides:
             overrides[section] = section_overrides
     return overrides
@@ -1511,7 +1855,9 @@ def run_optuna(
         storage=storage,
         load_if_exists=True,
         direction=direction,
-        sampler=build_optuna_sampler(optuna_args.optuna_sampler, optuna_args.optuna_seed),
+        sampler=build_optuna_sampler(
+            optuna_args.optuna_sampler, optuna_args.optuna_seed
+        ),
     )
 
     logger.info(
@@ -1580,13 +1926,21 @@ def run_optuna(
     with open(summary_path, "w", encoding="utf-8") as f:
         json.dump(summary, f, ensure_ascii=False, indent=2)
     logger.info("Saved Optuna summary to %s", summary_path)
-    logger.info("Best trial summary:\n%s", json.dumps(summary, ensure_ascii=False, indent=2))
+    logger.info(
+        "Best trial summary:\n%s", json.dumps(summary, ensure_ascii=False, indent=2)
+    )
 
 
 def main():
     # Use HfArgumentParser to parse all argument dataclasses
     parser = HfArgumentParser(
-        (ModelArguments, DataArguments, LoraArguments, TrainingArguments, OptunaArguments)
+        (
+            ModelArguments,
+            DataArguments,
+            LoraArguments,
+            TrainingArguments,
+            OptunaArguments,
+        )
     )
     model_args, data_args, lora_args, training_args, optuna_args = (
         parser.parse_args_into_dataclasses()

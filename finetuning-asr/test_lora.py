@@ -283,7 +283,7 @@ def load_lora_model(
     print(f"Loading base model from {base_model_path}")
 
     processor = VibeVoiceASRProcessor.from_pretrained(
-        base_model_path, language_model_pretrained_name="Qwen/Qwen2.5-7B"
+        base_model_path, language_model_pretrained_name="Qwen/Qwen2.5-1.5B"
     )
 
     model = VibeVoiceASRForConditionalGeneration.from_pretrained(
