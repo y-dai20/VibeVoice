@@ -9,7 +9,10 @@ This directory contains scripts for LoRA (Low-Rank Adaptation) fine-tuning of th
 pip install -e .
 
 pip install peft
+pip install wandb
 ```
+
+W&B を使う場合は、先に `wandb login` を実行してください。
 
 ## Toy Dataset
 
@@ -61,10 +64,14 @@ Each JSON file should have the following structure:
 
 ## Training
 
+W&B に送るには `--report_to wandb` を付け、必要なら `WANDB_PROJECT` を設定します。`run_name` を指定しない場合は `output_dir` 名が使われます。
+
 ### Basic
 
 ```bash
 # 1 GPU
+export WANDB_PROJECT=vibevoice-asr-lora
+
 torchrun --nproc_per_node=1 lora_finetune.py \
     --model_path microsoft/VibeVoice-ASR \
     --data_dir ./toy_dataset \
@@ -73,7 +80,7 @@ torchrun --nproc_per_node=1 lora_finetune.py \
     --per_device_train_batch_size 1 \
     --learning_rate 1e-4 \
     --bf16 \
-    --report_to none
+    --report_to wandb
 
 # Specific GPUs (e.g., GPU 0,1,2,3)
 CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun --nproc_per_node=4 lora_finetune.py \
@@ -84,7 +91,7 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun --nproc_per_node=4 lora_finetune.py \
     --per_device_train_batch_size 1 \
     --learning_rate 1e-4 \
     --bf16 \
-    --report_to none
+    --report_to wandb
 ```
 
 ### Full Options
@@ -110,7 +117,36 @@ torchrun --nproc_per_node=4 lora_finetune.py \
     --save_steps 100 \
     --gradient_checkpointing \
     --bf16 \
-    --report_to none
+    --report_to wandb
+```
+
+Validation を有効にするには、別ディレクトリを渡すか、学習データから自動分割します。
+validation が有効な場合、評価は `step` ごとに実行されます。`--eval_steps` を指定しなければ、`--save_steps`、それも無ければ `--logging_steps` が使われます。`--per_device_eval_batch_size` を指定しない場合は、OOM を避けるため `--per_device_train_batch_size` と同じ値を使います。
+
+```bash
+# Separate validation directory
+torchrun --nproc_per_node=1 lora_finetune.py \
+    --model_path microsoft/VibeVoice-ASR \
+    --data_dir ./train_dataset \
+    --validation_data_dir ./val_dataset \
+    --output_dir ./output \
+    --num_train_epochs 3 \
+    --per_device_train_batch_size 1 \
+    --eval_steps 50 \
+    --bf16 \
+    --report_to wandb
+
+# Split 10% of data_dir into validation
+torchrun --nproc_per_node=1 lora_finetune.py \
+    --model_path microsoft/VibeVoice-ASR \
+    --data_dir ./train_dataset \
+    --validation_split_ratio 0.1 \
+    --output_dir ./output \
+    --num_train_epochs 3 \
+    --per_device_train_batch_size 1 \
+    --eval_steps 50 \
+    --bf16 \
+    --report_to wandb
 ```
 
 ### Key Parameters
@@ -125,6 +161,8 @@ torchrun --nproc_per_node=4 lora_finetune.py \
 | `--learning_rate` | 5e-5 | Learning rate (1e-4 to 2e-4 typical for LoRA) |
 | `--gradient_checkpointing` | False | Enable to reduce memory usage |
 | `--use_customized_context` | True | Include customized_context from JSON as additional context |
+| `--validation_data_dir` | None | Separate validation dataset directory |
+| `--validation_split_ratio` | 0.0 | Reserve this fraction of `data_dir` for validation if no validation dir is given |
 | `--max_audio_length` | None | Skip audio longer than this (seconds) |
 
 ## Optuna Search
@@ -153,7 +191,7 @@ torchrun --nproc_per_node=1 lora_finetune.py \
     --test_data_dir ./toy_dataset \
     --output_dir ./output \
     --bf16 \
-    --report_to none \
+    --report_to wandb \
     --save_steps 50 \
     --optuna_search_space ./optuna_search_space.example.json \
     --optuna_n_trials 10 \
