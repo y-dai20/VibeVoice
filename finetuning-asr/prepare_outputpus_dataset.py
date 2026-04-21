@@ -89,59 +89,6 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Keep only samples whose segment texts look predominantly Japanese.",
     )
-    parser.add_argument(
-        "--min-japanese-ratio",
-        type=float,
-        default=0.3,
-        help=(
-            "Minimum ratio of Japanese-script characters required when "
-            "--japanese-only is enabled."
-        ),
-    )
-    parser.add_argument(
-        "--exclude-mixed-ja-en",
-        action="store_true",
-        help=(
-            "Skip samples that contain a segment with substantial amounts of "
-            "both Japanese and English text."
-        ),
-    )
-    parser.add_argument(
-        "--mixed-segment-min-chars",
-        type=int,
-        default=20,
-        help=(
-            "Minimum number of Japanese/Latin letters in a segment before the "
-            "mixed-language filter is considered."
-        ),
-    )
-    parser.add_argument(
-        "--mixed-segment-min-ratio",
-        type=float,
-        default=0.2,
-        help=(
-            "Minimum ratio required for both Japanese and English characters "
-            "for a segment to be treated as mixed."
-        ),
-    )
-    parser.add_argument(
-        "--mixed-segment-min-japanese-chars",
-        type=int,
-        default=10,
-        help=(
-            "Minimum Japanese-script character count for a segment to be "
-            "treated as mixed."
-        ),
-    )
-    parser.add_argument(
-        "--mixed-segment-min-english-chars",
-        type=int,
-        default=20,
-        help=(
-            "Minimum English alphabet character count for a segment to be "
-            "treated as mixed."
-        ),
-    )
     return parser.parse_args()
 
 
@@ -221,7 +168,13 @@ def resolve_audio_source(payload: Dict[str, Any], json_path: Path) -> Path:
     raise FileNotFoundError(f"Audio source not found for {json_path}")
 
 
-def infer_audio_duration(payload: Dict[str, Any]) -> float:
+def infer_audio_duration(payload: Dict[str, Any], audio_src: Path | None = None) -> float:
+    if audio_src is not None:
+        segments = normalize_segments(payload, audio_src)
+        if not segments:
+            return 0.0
+        return float(max(segment.get("end", 0.0) for segment in segments))
+
     explicit = payload.get("audio_duration")
     if explicit is not None:
         return float(explicit)
@@ -230,7 +183,7 @@ def infer_audio_duration(payload: Dict[str, Any]) -> float:
     if metadata.get("audio_duration") is not None:
         return float(metadata["audio_duration"])
 
-    segments: List[Dict[str, Any]] = canonical_segments(payload)
+    segments = canonical_segments(payload)
     if not segments:
         return 0.0
     return float(max(segment.get("end", 0.0) for segment in segments))
@@ -324,6 +277,31 @@ def speaker_label_from_id(value: Any) -> str:
     return f"speaker_{text}"
 
 
+def speaker_id_as_int(value: Any) -> int | None:
+    if value is None:
+        return None
+
+    text = str(value).strip()
+    if not text:
+        return None
+
+    if text.startswith("speaker_"):
+        text = text[len("speaker_") :]
+
+    try:
+        return int(text)
+    except (TypeError, ValueError):
+        pass
+
+    try:
+        number = float(text)
+    except (TypeError, ValueError):
+        return None
+    if not number.is_integer():
+        return None
+    return int(number)
+
+
 def extract_vibevoice_segments(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
     segments = payload.get("segments")
     if isinstance(segments, list):
@@ -350,7 +328,24 @@ def canonical_segments(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
 
     first = raw_segments[0]
     if {"start", "end", "speaker"}.issubset(first):
-        return [dict(segment) for segment in raw_segments]
+        normalized_existing: List[Dict[str, Any]] = []
+        for segment in raw_segments:
+            if not isinstance(segment, dict):
+                continue
+            if "start" not in segment or "end" not in segment:
+                continue
+            speaker_id = speaker_id_as_int(segment.get("speaker"))
+            if speaker_id is None:
+                continue
+            normalized_existing.append(
+                {
+                    "start": round(float(segment["start"]), 6),
+                    "end": round(float(segment["end"]), 6),
+                    "speaker": speaker_id,
+                    "text": str(segment.get("text", "")).strip(),
+                }
+            )
+        return normalized_existing
 
     normalized: List[Dict[str, Any]] = []
     for segment in raw_segments:
@@ -360,118 +355,79 @@ def canonical_segments(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
             continue
         if "speaker_id" not in segment:
             continue
+        speaker_id = speaker_id_as_int(segment.get("speaker_id"))
+        if speaker_id is None:
+            continue
         normalized.append(
             {
                 "start": round(float(segment["start_time"]), 6),
                 "end": round(float(segment["end_time"]), 6),
-                "speaker": speaker_label_from_id(segment["speaker_id"]),
+                "speaker": speaker_id,
                 "text": str(segment.get("text", "")).strip(),
             }
         )
     return normalized
 
 
-JAPANESE_CHAR_RE = re.compile(r"[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uff66-\uff9f]")
+KANA_CHAR_RE = re.compile(r"[\u3040-\u30ff\uff66-\uff9f]")
+CJK_CHAR_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff]")
 LATIN_CHAR_RE = re.compile(r"[A-Za-z]")
+DEFAULT_MIN_JAPANESE_RATIO = 0.8
+DEFAULT_JAPANESE_SEGMENT_CONFIDENCE_THRESHOLD = 0.8
 
 
 def japanese_text_ratio(text: str) -> float:
     if not text:
         return 0.0
 
-    japanese_chars = len(JAPANESE_CHAR_RE.findall(text))
+    kana_chars = len(KANA_CHAR_RE.findall(text))
+    cjk_chars = len(CJK_CHAR_RE.findall(text))
     latin_chars = len(LATIN_CHAR_RE.findall(text))
-    relevant_chars = japanese_chars + latin_chars
+    relevant_chars = kana_chars + cjk_chars + latin_chars
 
     if relevant_chars == 0:
         return 0.0
-    return japanese_chars / relevant_chars
 
+    if kana_chars == 0:
+        return (0.15 * cjk_chars) / relevant_chars
 
-def text_script_counts(text: str) -> tuple[int, int]:
-    japanese_chars = len(JAPANESE_CHAR_RE.findall(text))
-    latin_chars = len(LATIN_CHAR_RE.findall(text))
-    return japanese_chars, latin_chars
+    weighted_japanese_chars = kana_chars + (0.5 * cjk_chars)
+    confidence = (weighted_japanese_chars / relevant_chars) + 0.2
+    return min(confidence, 1.0)
 
 
 def sample_japanese_ratio(payload: Dict[str, Any]) -> float:
     segments: List[Dict[str, Any]] = canonical_segments(payload)
-    texts = [
-        str(segment.get("text", "")).strip()
-        for segment in segments
-        if str(segment.get("text", "")).strip()
+    segment_texts = [
+        str(segment.get("text", "")).strip() for segment in segments
     ]
-    if not texts:
+    segment_texts = [text for text in segment_texts if text]
+    if not segment_texts:
         return 0.0
 
-    combined_text = "\n".join(texts)
-    return japanese_text_ratio(combined_text)
-
-
-def has_mixed_japanese_english_segment(
-    payload: Dict[str, Any],
-    mixed_segment_min_chars: int,
-    mixed_segment_min_ratio: float,
-    mixed_segment_min_japanese_chars: int,
-    mixed_segment_min_english_chars: int,
-) -> bool:
-    segments: List[Dict[str, Any]] = canonical_segments(payload)
-    for segment in segments:
-        text = str(segment.get("text", "")).strip()
-        if not text:
-            continue
-
-        japanese_chars, latin_chars = text_script_counts(text)
-        relevant_chars = japanese_chars + latin_chars
-        if relevant_chars < mixed_segment_min_chars:
-            continue
-        if japanese_chars == 0 or latin_chars == 0:
-            continue
-
-        japanese_ratio = japanese_chars / relevant_chars
-        latin_ratio = latin_chars / relevant_chars
-        if (
-            japanese_chars >= mixed_segment_min_japanese_chars
-            and latin_chars >= mixed_segment_min_english_chars
-        ):
-            return True
-        if (
-            japanese_ratio >= mixed_segment_min_ratio
-            and latin_ratio >= mixed_segment_min_ratio
-        ):
-            return True
-
-    return False
+    passed_segments = sum(
+        1
+        for text in segment_texts
+        if japanese_text_ratio(text) >= DEFAULT_JAPANESE_SEGMENT_CONFIDENCE_THRESHOLD
+    )
+    return passed_segments / len(segment_texts)
 
 
 def should_keep_sample(
     payload: Dict[str, Any],
+    audio_src: Path,
     min_segments: int,
     min_mix_speakers: int,
     min_duration: float,
     japanese_only: bool,
-    min_japanese_ratio: float,
-    exclude_mixed_ja_en: bool,
-    mixed_segment_min_chars: int,
-    mixed_segment_min_ratio: float,
-    mixed_segment_min_japanese_chars: int,
-    mixed_segment_min_english_chars: int,
 ) -> bool:
     if count_segments(payload) < min_segments:
         return False
     if count_unique_speakers(payload) < min_mix_speakers:
         return False
-    if infer_audio_duration(payload) < min_duration:
+    if infer_audio_duration(payload, audio_src=audio_src) < min_duration:
         return False
-    if japanese_only and sample_japanese_ratio(payload) < min_japanese_ratio:
-        return False
-    if exclude_mixed_ja_en and has_mixed_japanese_english_segment(
-        payload,
-        mixed_segment_min_chars=mixed_segment_min_chars,
-        mixed_segment_min_ratio=mixed_segment_min_ratio,
-        mixed_segment_min_japanese_chars=mixed_segment_min_japanese_chars,
-        mixed_segment_min_english_chars=mixed_segment_min_english_chars,
-    ):
+    if japanese_only and sample_japanese_ratio(payload) < DEFAULT_MIN_JAPANESE_RATIO:
         return False
     return True
 
@@ -479,12 +435,12 @@ def should_keep_sample(
 def copy_sample(
     json_path: Path,
     payload: Dict[str, Any],
+    audio_src: Path,
     source_dir: Path,
     output_dir: Path,
     force: bool,
 ) -> str:
     sample_id = build_sample_id(json_path, source_dir)
-    audio_src = resolve_audio_source(payload, json_path)
     audio_dst = output_dir / f"{sample_id}{audio_src.suffix.lower()}"
     json_dst = output_dir / f"{sample_id}.json"
 
@@ -526,34 +482,31 @@ def main() -> int:
     skipped_ids: List[str] = []
     failed_samples: List[str] = []
     for json_path in dataset_files:
+        sample_id = build_sample_id(json_path, source_dir)
         payload = load_json(json_path)
-        if not should_keep_sample(
-            payload,
-            min_segments=args.min_segments,
-            min_mix_speakers=args.min_mix_speakers,
-            min_duration=args.min_duration,
-            japanese_only=args.japanese_only,
-            min_japanese_ratio=args.min_japanese_ratio,
-            exclude_mixed_ja_en=args.exclude_mixed_ja_en,
-            mixed_segment_min_chars=args.mixed_segment_min_chars,
-            mixed_segment_min_ratio=args.mixed_segment_min_ratio,
-            mixed_segment_min_japanese_chars=args.mixed_segment_min_japanese_chars,
-            mixed_segment_min_english_chars=args.mixed_segment_min_english_chars,
-        ):
-            skipped_ids.append(build_sample_id(json_path, source_dir))
-            continue
         try:
+            audio_src = resolve_audio_source(payload, json_path)
+            if not should_keep_sample(
+                payload,
+                audio_src=audio_src,
+                min_segments=args.min_segments,
+                min_mix_speakers=args.min_mix_speakers,
+                min_duration=args.min_duration,
+                japanese_only=args.japanese_only,
+            ):
+                skipped_ids.append(sample_id)
+                continue
             copied_ids.append(
                 copy_sample(
                     json_path,
                     payload,
+                    audio_src,
                     source_dir,
                     output_dir,
                     force=args.force,
                 )
             )
         except Exception as exc:
-            sample_id = build_sample_id(json_path, source_dir)
             failed_samples.append(sample_id)
             print(f"Skipping failed sample {sample_id}: {exc}")
             continue
@@ -568,14 +521,9 @@ def main() -> int:
             f"min_mix_speakers={args.min_mix_speakers}, "
             f"min_duration={args.min_duration}, "
             f"japanese_only={args.japanese_only}, "
-            f"min_japanese_ratio={args.min_japanese_ratio}, "
-            f"exclude_mixed_ja_en={args.exclude_mixed_ja_en}, "
-            f"mixed_segment_min_chars={args.mixed_segment_min_chars}, "
-            f"mixed_segment_min_ratio={args.mixed_segment_min_ratio}, "
-            f"mixed_segment_min_japanese_chars="
-            f"{args.mixed_segment_min_japanese_chars}, "
-            f"mixed_segment_min_english_chars="
-            f"{args.mixed_segment_min_english_chars})"
+            f"min_japanese_ratio={DEFAULT_MIN_JAPANESE_RATIO}, "
+            f"japanese_segment_confidence_threshold="
+            f"{DEFAULT_JAPANESE_SEGMENT_CONFIDENCE_THRESHOLD})"
         )
     if failed_samples:
         print(f"Skipped {len(failed_samples)} samples due to errors")

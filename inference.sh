@@ -7,4 +7,4 @@ uv run python inference.py \
     --content_no_repeat_ngram_size 10 \
     --content_no_repeat_decode_max_tokens 1024 \
     --content_no_repeat_debug \
-    --audio_files /home/yamad/workspace/tests/assets/youtube/イクサガミ_600.mp4
+    --audio_files /workspace/dataset/wasabi/apple_podcast_dataset/video/

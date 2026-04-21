@@ -10,6 +10,7 @@ import json
 import logging
 import copy
 import os
+import random
 from pathlib import Path
 from typing import List, Dict, Any, Optional, Tuple, Set
 from dataclasses import asdict, dataclass, field, replace
@@ -59,6 +60,17 @@ def uses_wandb(report_to: Any) -> bool:
     if isinstance(report_to, (list, tuple, set)):
         return any(str(item).strip().lower() == "wandb" for item in report_to)
     return False
+
+
+def _make_wandb_safe_key(value: str) -> str:
+    safe_chars = []
+    for char in value:
+        if char.isalnum() or char in {"_", "-", "."}:
+            safe_chars.append(char)
+        else:
+            safe_chars.append("_")
+    safe_value = "".join(safe_chars).strip("_.")
+    return safe_value or "unknown"
 
 
 @dataclass
@@ -525,6 +537,22 @@ class VibeVoiceASRDataset(Dataset):
         self._invalid_indices.add(idx)
 
 
+def _extract_json_filenames(dataset: Dataset) -> List[str]:
+    """Extract JSON filenames represented by a dataset or subset."""
+    if isinstance(dataset, VibeVoiceASRDataset):
+        return [Path(sample["json_path"]).name for sample in dataset.samples]
+
+    if isinstance(dataset, Subset) and isinstance(dataset.dataset, VibeVoiceASRDataset):
+        base_dataset = dataset.dataset
+        filenames = []
+        for index in dataset.indices:
+            sample = base_dataset.samples[index]
+            filenames.append(Path(sample["json_path"]).name)
+        return filenames
+
+    return []
+
+
 def extract_json_array(text: str) -> str:
     """
     Extract JSON array from text that may contain chat template artifacts.
@@ -682,6 +710,7 @@ def run_inference_on_test_set(
     content_no_repeat_ngram_size: int = 0,
     content_no_repeat_decode_max_tokens: int = 2048,
     content_no_repeat_debug: bool = False,
+    seed: int = 42,
 ) -> List[Dict[str, Any]]:
     """
     Run inference on test dataset samples and return results.
@@ -692,10 +721,18 @@ def run_inference_on_test_set(
         test_dataset: Test dataset
         max_samples: Maximum number of samples to evaluate
         device: Device to run inference on
+        seed: Random seed for reproducibility
 
     Returns:
         List of inference results with predictions and ground truth
     """
+    # Set seed for reproducibility
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+    random.seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
     model.eval()
     results = []
     logits_processor = (
@@ -837,6 +874,7 @@ class TestInferenceCallback(TrainerCallback):
         content_no_repeat_ngram_size: int = 3,
         content_no_repeat_decode_max_tokens: int = 1024,
         content_no_repeat_debug: bool = False,
+        seed: int = 42,
     ):
         """
         Initialize the callback.
@@ -847,6 +885,7 @@ class TestInferenceCallback(TrainerCallback):
             eval_steps: Run inference every N steps
             max_test_samples: Maximum number of test samples to evaluate
             save_weights: Whether to save model weights at each evaluation
+            seed: Random seed for reproducibility
         """
         self.test_dataset = test_dataset
         self.processor = processor
@@ -856,6 +895,7 @@ class TestInferenceCallback(TrainerCallback):
         self.content_no_repeat_ngram_size = content_no_repeat_ngram_size
         self.content_no_repeat_decode_max_tokens = content_no_repeat_decode_max_tokens
         self.content_no_repeat_debug = content_no_repeat_debug
+        self.seed = seed
         self.latest_der_summary: Optional[Dict[str, Any]] = None
         self.latest_cer_summary: Optional[Dict[str, Any]] = None
         self.best_average_der: Optional[float] = None
@@ -878,6 +918,7 @@ class TestInferenceCallback(TrainerCallback):
             content_no_repeat_ngram_size=self.content_no_repeat_ngram_size,
             content_no_repeat_decode_max_tokens=self.content_no_repeat_decode_max_tokens,
             content_no_repeat_debug=self.content_no_repeat_debug,
+            seed=self.seed,
         )
 
         results_dir = Path(args.output_dir) / "test_results"
@@ -965,6 +1006,25 @@ class TestInferenceCallback(TrainerCallback):
             logger.info(f"  Missed Detection: {avg_missed:.4f}")
             logger.info(f"{'=' * 80}\n")
 
+            per_file_der = []
+            for result in results:
+                der_metrics = result.get("der_metrics")
+                if not der_metrics:
+                    continue
+                file_id = Path(result["audio_path"]).stem
+                per_file_der.append(
+                    {
+                        "sample_idx": result["sample_idx"],
+                        "audio_path": result["audio_path"],
+                        "file_id": file_id,
+                        "wandb_key": _make_wandb_safe_key(file_id),
+                        "DER": der_metrics["DER"],
+                        "confusion": der_metrics["confusion"],
+                        "false_alarm": der_metrics["false_alarm"],
+                        "missed_detection": der_metrics["missed_detection"],
+                    }
+                )
+
             der_summary = {
                 "step": state.global_step,
                 "num_samples": len(der_values),
@@ -972,6 +1032,7 @@ class TestInferenceCallback(TrainerCallback):
                 "average_confusion": avg_confusion,
                 "average_false_alarm": avg_false_alarm,
                 "average_missed_detection": avg_missed,
+                "per_file_DER": per_file_der,
             }
             self.latest_der_summary = der_summary
             if self.best_average_der is None or avg_der < self.best_average_der:
@@ -1046,6 +1107,12 @@ class TestInferenceCallback(TrainerCallback):
                             wandb_payload["test_der_missed_detection"] = (
                                 self.latest_der_summary["average_missed_detection"]
                             )
+                            for per_file_metrics in self.latest_der_summary.get(
+                                "per_file_DER", []
+                            ):
+                                wandb_payload[
+                                    f"test_der_by_file/{per_file_metrics['wandb_key']}"
+                                ] = per_file_metrics["DER"]
                         wandb.log(wandb_payload, step=state.global_step)
                 except Exception as e:
                     logger.warning("Failed to log test CER/DER to wandb: %s", e)
@@ -1468,6 +1535,7 @@ def train(
         "train": {
             "data_dir": data_args.data_dir,
             "num_samples": len(full_train_dataset),
+            "json_filenames": _extract_json_filenames(full_train_dataset),
         }
     }
 
@@ -1483,6 +1551,7 @@ def train(
         dataset_summary["validation"] = {
             "data_dir": data_args.validation_data_dir,
             "num_samples": len(eval_dataset),
+            "json_filenames": _extract_json_filenames(eval_dataset),
         }
     elif data_args.validation_split_ratio > 0:
         if not 0.0 < data_args.validation_split_ratio < 1.0:
@@ -1502,10 +1571,14 @@ def train(
         train_dataset = Subset(full_train_dataset, train_indices)
         eval_dataset = Subset(full_train_dataset, val_indices)
         dataset_summary["train"]["num_samples"] = len(train_dataset)
+        dataset_summary["train"]["json_filenames"] = _extract_json_filenames(
+            train_dataset
+        )
         dataset_summary["validation"] = {
             "data_dir": data_args.data_dir,
             "split_ratio": data_args.validation_split_ratio,
             "num_samples": len(eval_dataset),
+            "json_filenames": _extract_json_filenames(eval_dataset),
         }
         logger.info(
             "Split dataset into train=%d and validation=%d using seed=%d",
@@ -1529,6 +1602,7 @@ def train(
         dataset_summary["test"] = {
             "data_dir": data_args.test_data_dir,
             "num_samples": len(test_dataset),
+            "json_filenames": _extract_json_filenames(test_dataset),
         }
     save_argument_snapshot(
         model_args=model_args,
@@ -1587,11 +1661,12 @@ def train(
             test_dataset=test_dataset,
             processor=processor,
             eval_steps=training_args.save_steps,
-            max_test_samples=5,
+            max_test_samples=10,
             save_weights=True,
             content_no_repeat_ngram_size=data_args.content_no_repeat_ngram_size,
             content_no_repeat_decode_max_tokens=data_args.content_no_repeat_decode_max_tokens,
             content_no_repeat_debug=data_args.content_no_repeat_debug,
+            seed=training_args.seed,
         )
         callbacks.append(test_callback)
         logger.info(f"Test inference will run every {training_args.save_steps} steps")

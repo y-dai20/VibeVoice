@@ -10,6 +10,43 @@ from typing import Any, Callable
 StructuredParser = Callable[[str], list[dict[str, Any]]]
 
 
+def _find_balanced_json_end(
+    text: str,
+    start_index: int,
+    open_char: str,
+    close_char: str,
+) -> int:
+    depth = 0
+    in_string = False
+    is_escaped = False
+
+    for index in range(start_index, len(text)):
+        char = text[index]
+        if in_string:
+            if is_escaped:
+                is_escaped = False
+            elif char == "\\":
+                is_escaped = True
+            elif char == '"':
+                in_string = False
+            continue
+
+        if char == '"':
+            in_string = True
+            continue
+
+        if char == open_char:
+            depth += 1
+            continue
+
+        if char == close_char:
+            depth -= 1
+            if depth == 0:
+                return index + 1
+
+    return -1
+
+
 def normalize_generated_text(text: str) -> str:
     """Trim model-role prefixes from generated text."""
     normalized = (text or "").strip()
@@ -29,25 +66,36 @@ def extract_json_payload(text: str) -> str | None:
         if json_end > json_start:
             return text[json_start:json_end].strip()
 
-    json_start = text.find("[")
-    if json_start == -1:
-        json_start = text.find("{")
-    if json_start == -1:
-        return None
+    decoder = json.JSONDecoder()
 
-    bracket_count = 0
-    json_end = -1
-    for index in range(json_start, len(text)):
-        if text[index] in "[{":
-            bracket_count += 1
-        elif text[index] in "]}":
-            bracket_count -= 1
-            if bracket_count == 0:
-                json_end = index + 1
-                break
-    if json_end == -1:
-        return None
-    return text[json_start:json_end]
+    array_start = text.find("[")
+    object_start = text.find("{")
+
+    if array_start != -1 and (object_start == -1 or array_start < object_start):
+        try:
+            _, end = decoder.raw_decode(text[array_start:])
+            return text[array_start : array_start + end]
+        except Exception:
+            pass
+
+        array_end = _find_balanced_json_end(text, array_start, "[", "]")
+        if array_end != -1:
+            return text[array_start:array_end]
+
+        return text[array_start:].strip()
+
+    for index, char in enumerate(text):
+        if char != "{":
+            continue
+        try:
+            _, end = decoder.raw_decode(text[index:])
+            return text[index : index + end]
+        except Exception:
+            json_end = _find_balanced_json_end(text, index, "{", "}")
+            if json_end != -1:
+                return text[index:json_end]
+
+    return None
 
 
 def _repair_common_json_issues(payload: str) -> str:
@@ -79,6 +127,92 @@ def _load_json_payload(payload: str) -> list[dict[str, Any]]:
     if not isinstance(result, list):
         return []
     return [item for item in result if isinstance(item, dict)]
+
+
+def _extract_json_object_literals_strict(payload: str) -> list[str]:
+    literals: list[str] = []
+    start_index: int | None = None
+    brace_depth = 0
+    in_string = False
+    is_escaped = False
+
+    for index, char in enumerate(payload):
+        if in_string:
+            if is_escaped:
+                is_escaped = False
+            elif char == "\\":
+                is_escaped = True
+            elif char == '"':
+                in_string = False
+            continue
+
+        if char == '"':
+            in_string = True
+            continue
+
+        if char == "{":
+            if brace_depth == 0:
+                start_index = index
+            brace_depth += 1
+            continue
+
+        if char == "}" and brace_depth > 0:
+            brace_depth -= 1
+            if brace_depth == 0 and start_index is not None:
+                literals.append(payload[start_index : index + 1])
+                start_index = None
+
+    return literals
+
+
+def _extract_json_object_literals_permissive(payload: str) -> list[str]:
+    literals: list[str] = []
+    start_index: int | None = None
+    brace_depth = 0
+
+    for index, char in enumerate(payload):
+        if char == "{":
+            if brace_depth == 0:
+                start_index = index
+            brace_depth += 1
+            continue
+
+        if char == "}" and brace_depth > 0:
+            brace_depth -= 1
+            if brace_depth == 0 and start_index is not None:
+                literals.append(payload[start_index : index + 1])
+                start_index = None
+
+    return literals
+
+
+def _extract_json_object_literals(payload: str) -> list[str]:
+    strict_literals = _extract_json_object_literals_strict(payload)
+    permissive_literals = _extract_json_object_literals_permissive(payload)
+
+    merged: list[str] = []
+    seen: set[str] = set()
+    for literal in strict_literals + permissive_literals:
+        if literal in seen:
+            continue
+        seen.add(literal)
+        merged.append(literal)
+
+    return merged
+
+
+def _load_json_payload_best_effort(payload: str) -> list[dict[str, Any]]:
+    items: list[dict[str, Any]] = []
+    for literal in _extract_json_object_literals(payload):
+        for candidate in (literal, _repair_common_json_issues(literal)):
+            try:
+                result = json.loads(candidate)
+            except Exception:
+                continue
+            if isinstance(result, dict):
+                items.append(result)
+                break
+    return items
 
 
 def canonicalize_segment_items(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -123,10 +257,13 @@ def parse_structured_generation(
         return []
 
     for candidate in (payload, _repair_common_json_issues(payload)):
+        items: list[dict[str, Any]] = []
         try:
             items = _load_json_payload(candidate)
-            if items:
-                return canonicalize_segment_items(items)
         except Exception:
-            continue
+            pass
+        if not items:
+            items = _load_json_payload_best_effort(candidate)
+        if items:
+            return canonicalize_segment_items(items)
     return []
