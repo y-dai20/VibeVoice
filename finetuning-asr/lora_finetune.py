@@ -26,6 +26,7 @@ from transformers import (
     HfArgumentParser,
     TrainerCallback,
 )
+from transformers.trainer_utils import get_last_checkpoint
 from peft import (
     LoraConfig,
     get_peft_model,
@@ -1229,6 +1230,31 @@ def setup_output_logging(output_dir: str, log_filename: str = "training.log") ->
     return log_path
 
 
+def resolve_resume_from_checkpoint(
+    resume_from_checkpoint: Optional[str], output_dir: str
+) -> Optional[str]:
+    if resume_from_checkpoint is None:
+        return None
+
+    checkpoint_value = resume_from_checkpoint.strip()
+    if not checkpoint_value:
+        return None
+
+    if checkpoint_value.lower() in {"auto", "latest", "true"}:
+        latest_checkpoint = get_last_checkpoint(output_dir)
+        if latest_checkpoint is None:
+            raise ValueError(
+                f"No checkpoint found under output_dir={output_dir!r} to resume from."
+            )
+        return latest_checkpoint
+
+    checkpoint_path = Path(checkpoint_value).expanduser().resolve()
+    if not checkpoint_path.exists():
+        raise ValueError(f"Checkpoint not found: {checkpoint_path}")
+
+    return str(checkpoint_path)
+
+
 def save_argument_snapshot(
     model_args: ModelArguments,
     data_args: DataArguments,
@@ -1462,6 +1488,7 @@ def train(
     lora_args: LoraArguments,
     training_args: TrainingArguments,
     gradient_checkpointing: bool = True,
+    resume_from_checkpoint: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Main training function for LoRA fine-tuning.
@@ -1474,6 +1501,14 @@ def train(
         gradient_checkpointing: Whether to use gradient checkpointing
     """
     log_path = setup_output_logging(training_args.output_dir)
+    resolved_resume_from_checkpoint = resolve_resume_from_checkpoint(
+        resume_from_checkpoint=resume_from_checkpoint,
+        output_dir=training_args.output_dir,
+    )
+    if resolved_resume_from_checkpoint is not None:
+        logger.info(
+            "Resuming training from checkpoint %s", resolved_resume_from_checkpoint
+        )
     if uses_wandb(training_args.report_to):
         if not training_args.run_name:
             training_args.run_name = Path(training_args.output_dir).resolve().name
@@ -1701,7 +1736,12 @@ def train(
     )
     logger.info(f"  Total optimization steps = {total_steps}")
 
-    train_result = trainer.train()
+    if resolved_resume_from_checkpoint is None:
+        train_result = trainer.train()
+    else:
+        train_result = trainer.train(
+            resume_from_checkpoint=resolved_resume_from_checkpoint
+        )
 
     # Save final model
     logger.info(f"Saving model to {training_args.output_dir}")
@@ -1989,6 +2029,10 @@ def main():
     )
 
     if optuna_args.optuna_search_space:
+        if training_args.resume_from_checkpoint is not None:
+            raise ValueError(
+                "resume_from_checkpoint is not supported when running Optuna trials."
+            )
         run_optuna(
             model_args=model_args,
             data_args=data_args,
@@ -2002,6 +2046,7 @@ def main():
             data_args=data_args,
             lora_args=lora_args,
             training_args=training_args,
+            resume_from_checkpoint=training_args.resume_from_checkpoint,
         )
 
 
