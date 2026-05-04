@@ -15,20 +15,20 @@ HF_HUB_ENABLE_HF_TRANSFER=0 HF_HUB_DISABLE_XET=1 uv run torchrun --nproc_per_nod
   --data_dir /workspace/dataset_v2 \
   --test_data_dir /workspace/assets \
   --output_dir "${output_dir}" \
-  --lora_r 8 \
-  --lora_alpha 16 \
+  --lora_r 4 \
+  --lora_alpha 8 \
   --lora_dropout 0.05 \
-  --num_train_epochs 3 \
+  --num_train_epochs 15 \
   --per_device_train_batch_size 2 \
   --gradient_accumulation_steps 4 \
-  --learning_rate 7e-5 \
+  --learning_rate 3e-5 \
   --lr_scheduler_type cosine \
   --warmup_ratio 0.05 \
   --weight_decay 0.01 \
   --max_grad_norm 1.0 \
   --logging_steps 10 \
-  --save_steps 20 \
-  --validation_split_ratio 0.05 \
+  --save_steps 50 \
+  --validation_split_ratio 0.0 \
   --content_no_repeat_ngram_size 3 \
   --gradient_checkpointing \
   --bf16 \

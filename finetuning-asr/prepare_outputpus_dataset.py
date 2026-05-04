@@ -24,6 +24,7 @@ Each sample is flattened into the output directory as:
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import re
 import shutil
@@ -49,6 +50,11 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=Path("/workspace/VibeVoice/finetuning-asr/outputs"),
         help="Destination directory for flattened dataset files.",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Show how many samples would be prepared without copying files.",
     )
     parser.add_argument(
         "--force",
@@ -89,6 +95,42 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Keep only samples whose segment texts look predominantly Japanese.",
     )
+    parser.add_argument(
+        "--report-path",
+        type=Path,
+        default=None,
+        help="Optional path to report.csv or report.json. Defaults to <source-dir>/report.csv or report.json when threshold filters are enabled.",
+    )
+    parser.add_argument(
+        "--max-der",
+        type=float,
+        default=None,
+        help="Skip samples whose DER exceeds this threshold.",
+    )
+    parser.add_argument(
+        "--max-confusion",
+        type=float,
+        default=None,
+        help="Skip samples whose confusion duration exceeds this threshold.",
+    )
+    parser.add_argument(
+        "--max-missed-detection",
+        type=float,
+        default=None,
+        help="Skip samples whose missed_detection duration exceeds this threshold.",
+    )
+    parser.add_argument(
+        "--max-false-alarm",
+        type=float,
+        default=None,
+        help="Skip samples whose false_alarm duration exceeds this threshold.",
+    )
+    parser.add_argument(
+        "--max-speaker-count-diff",
+        type=int,
+        default=None,
+        help="Skip samples whose absolute difference between ref_speaker_count and hyp_speaker_count exceeds this threshold. 0 means exact match.",
+    )
     return parser.parse_args()
 
 
@@ -118,6 +160,161 @@ def load_json(path: Path) -> Dict[str, Any]:
         return json.load(f)
 
 
+def parse_optional_float(value: Any) -> float | None:
+    if value in (None, "", "None"):
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def parse_optional_int(value: Any) -> int | None:
+    if value in (None, "", "None"):
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def report_thresholds_enabled(args: argparse.Namespace) -> bool:
+    return any(
+        value is not None
+        for value in (
+            args.max_der,
+            args.max_confusion,
+            args.max_missed_detection,
+            args.max_false_alarm,
+            args.max_speaker_count_diff,
+        )
+    )
+
+
+def resolve_report_path(source_dir: Path, explicit_path: Path | None) -> Path | None:
+    if explicit_path is not None:
+        return explicit_path.expanduser().resolve()
+    for name in ("report.csv", "report.json"):
+        candidate = source_dir / name
+        if candidate.exists():
+            return candidate.resolve()
+    return None
+
+
+def build_report_sample_id(row: Dict[str, Any]) -> str | None:
+    sample_id = row.get("sample_id")
+    if sample_id not in (None, ""):
+        return str(sample_id)
+    data_id = row.get("data_id")
+    if data_id in (None, ""):
+        return None
+    chunk_id = row.get("chunk_id")
+    if chunk_id not in (None, ""):
+        return f"{data_id}_{chunk_id}"
+    return str(data_id)
+
+
+def load_report_index(report_path: Path) -> Dict[str, Dict[str, Any]]:
+    if report_path.suffix.lower() == ".csv":
+        with report_path.open("r", encoding="utf-8", newline="") as handle:
+            rows = list(csv.DictReader(handle))
+    elif report_path.suffix.lower() == ".json":
+        payload = load_json(report_path)
+        results = payload.get("results")
+        if not isinstance(results, list):
+            raise ValueError(f"Invalid report JSON format: {report_path}")
+        rows = [row for row in results if isinstance(row, dict)]
+    else:
+        raise ValueError(f"Unsupported report format: {report_path}")
+
+    index: Dict[str, Dict[str, Any]] = {}
+    for row in rows:
+        sample_id = build_report_sample_id(row)
+        if sample_id is None:
+            continue
+        normalized = dict(row)
+        normalized["der"] = parse_optional_float(row.get("der"))
+        normalized["confusion"] = parse_optional_float(row.get("confusion"))
+        normalized["missed_detection"] = parse_optional_float(
+            row.get("missed_detection")
+        )
+        normalized["false_alarm"] = parse_optional_float(row.get("false_alarm"))
+        normalized["ref_speaker_count"] = parse_optional_int(
+            row.get("ref_speaker_count")
+        )
+        normalized["hyp_speaker_count"] = parse_optional_int(
+            row.get("hyp_speaker_count")
+        )
+        index[sample_id] = normalized
+    return index
+
+
+def collect_report_filter_failures(
+    report_row: Dict[str, Any] | None,
+    max_der: float | None,
+    max_confusion: float | None,
+    max_missed_detection: float | None,
+    max_false_alarm: float | None,
+    max_speaker_count_diff: int | None,
+) -> List[str]:
+    failures: List[str] = []
+    if (
+        max_der is None
+        and max_confusion is None
+        and max_missed_detection is None
+        and max_false_alarm is None
+        and max_speaker_count_diff is None
+    ):
+        return failures
+    if report_row is None:
+        return ["missing_report_row"]
+    status = str(report_row.get("status", ""))
+    if status and status != "ok":
+        failures.append(f"report_status={status}")
+    if max_der is not None and report_row.get("der") is None:
+        failures.append("missing_der")
+    if max_confusion is not None and report_row.get("confusion") is None:
+        failures.append("missing_confusion")
+    if max_missed_detection is not None and report_row.get("missed_detection") is None:
+        failures.append("missing_missed_detection")
+    if max_false_alarm is not None and report_row.get("false_alarm") is None:
+        failures.append("missing_false_alarm")
+    if max_speaker_count_diff is not None and (
+        report_row.get("ref_speaker_count") is None
+        or report_row.get("hyp_speaker_count") is None
+    ):
+        failures.append("missing_speaker_count")
+    if failures:
+        return failures
+    if max_der is not None and float(report_row["der"]) > max_der:
+        failures.append(f"der={float(report_row['der']):.6f}>{max_der}")
+    if max_confusion is not None and float(report_row["confusion"]) > max_confusion:
+        failures.append(
+            f"confusion={float(report_row['confusion']):.6f}>{max_confusion}"
+        )
+    if (
+        max_missed_detection is not None
+        and float(report_row["missed_detection"]) > max_missed_detection
+    ):
+        failures.append(
+            "missed_detection="
+            f"{float(report_row['missed_detection']):.6f}>{max_missed_detection}"
+        )
+    if max_false_alarm is not None and float(report_row["false_alarm"]) > max_false_alarm:
+        failures.append(
+            f"false_alarm={float(report_row['false_alarm']):.6f}>{max_false_alarm}"
+        )
+    if max_speaker_count_diff is not None and abs(
+        int(report_row["ref_speaker_count"]) - int(report_row["hyp_speaker_count"])
+    ) > max_speaker_count_diff:
+        failures.append(
+            "speaker_count_diff="
+            f"{abs(int(report_row['ref_speaker_count']) - int(report_row['hyp_speaker_count']))}"
+            f">{max_speaker_count_diff}"
+        )
+    return failures
+
+
 def build_sample_id(json_path: Path, source_dir: Path) -> str:
     full_parts = json_path.parts
 
@@ -143,7 +340,9 @@ def build_sample_id(json_path: Path, source_dir: Path) -> str:
 def resolve_audio_source(payload: Dict[str, Any], json_path: Path) -> Path:
     metadata = payload.get("metadata") or {}
     candidates = [
+        metadata.get("content_input_path"),
         metadata.get("speech_input_path"),
+        metadata.get("pyannote_input_path"),
         metadata.get("input_path"),
         payload.get("audio_path"),
         payload.get("audio_file"),
@@ -191,10 +390,15 @@ def infer_audio_duration(payload: Dict[str, Any], audio_src: Path | None = None)
 
 def is_chunk_audio(payload: Dict[str, Any], audio_src: Path) -> bool:
     metadata = payload.get("metadata") or {}
-    speech_input_path = metadata.get("speech_input_path")
-    if speech_input_path:
+    for candidate in (
+        metadata.get("content_input_path"),
+        metadata.get("speech_input_path"),
+        metadata.get("pyannote_input_path"),
+    ):
         try:
-            if Path(speech_input_path).name == audio_src.name and "chunks/audio" in speech_input_path:
+            if candidate and Path(candidate).name == audio_src.name and (
+                "chunks/content" in candidate or "chunks/audio" in candidate
+            ):
                 return True
         except TypeError:
             pass
@@ -413,23 +617,47 @@ def sample_japanese_ratio(payload: Dict[str, Any]) -> float:
     return passed_segments / len(segment_texts)
 
 
-def should_keep_sample(
+def collect_sample_filter_failures(
     payload: Dict[str, Any],
     audio_src: Path,
     min_segments: int,
     min_mix_speakers: int,
     min_duration: float,
     japanese_only: bool,
-) -> bool:
-    if count_segments(payload) < min_segments:
-        return False
-    if count_unique_speakers(payload) < min_mix_speakers:
-        return False
-    if infer_audio_duration(payload, audio_src=audio_src) < min_duration:
-        return False
-    if japanese_only and sample_japanese_ratio(payload) < DEFAULT_MIN_JAPANESE_RATIO:
-        return False
-    return True
+    report_row: Dict[str, Any] | None,
+    max_der: float | None,
+    max_confusion: float | None,
+    max_missed_detection: float | None,
+    max_false_alarm: float | None,
+    max_speaker_count_diff: int | None,
+ ) -> List[str]:
+    failures: List[str] = []
+    segment_count = count_segments(payload)
+    if segment_count < min_segments:
+        failures.append(f"segment_count={segment_count}<{min_segments}")
+    speaker_count = count_unique_speakers(payload)
+    if speaker_count < min_mix_speakers:
+        failures.append(f"speaker_count={speaker_count}<{min_mix_speakers}")
+    duration = infer_audio_duration(payload, audio_src=audio_src)
+    if duration < min_duration:
+        failures.append(f"duration={duration:.6f}<{min_duration}")
+    if japanese_only:
+        japanese_ratio = sample_japanese_ratio(payload)
+        if japanese_ratio < DEFAULT_MIN_JAPANESE_RATIO:
+            failures.append(
+                f"japanese_ratio={japanese_ratio:.6f}<{DEFAULT_MIN_JAPANESE_RATIO}"
+            )
+    failures.extend(
+        collect_report_filter_failures(
+        report_row,
+        max_der=max_der,
+        max_confusion=max_confusion,
+        max_missed_detection=max_missed_detection,
+        max_false_alarm=max_false_alarm,
+        max_speaker_count_diff=max_speaker_count_diff,
+        )
+    )
+    return failures
 
 
 def copy_sample(
@@ -476,55 +704,87 @@ def main() -> int:
             f"(input_format={args.input_format})"
         )
 
-    output_dir.mkdir(parents=True, exist_ok=True)
+    report_index: Dict[str, Dict[str, Any]] = {}
+    resolved_report_path = resolve_report_path(source_dir, args.report_path)
+    if resolved_report_path is None or not resolved_report_path.exists():
+        raise FileNotFoundError(
+            "Report threshold filters were requested, but report.csv/report.json was not found. "
+            f"source_dir={source_dir}"
+        )
+    report_index = load_report_index(resolved_report_path)
+
+    if not args.dry_run:
+        output_dir.mkdir(parents=True, exist_ok=True)
 
     copied_ids: List[str] = []
-    skipped_ids: List[str] = []
+    skipped_samples: List[tuple[str, List[str]]] = []
     failed_samples: List[str] = []
     for json_path in dataset_files:
         sample_id = build_sample_id(json_path, source_dir)
         payload = load_json(json_path)
         try:
+            report_row = report_index.get(sample_id) if report_index else None
             audio_src = resolve_audio_source(payload, json_path)
-            if not should_keep_sample(
+            filter_failures = collect_sample_filter_failures(
                 payload,
                 audio_src=audio_src,
                 min_segments=args.min_segments,
                 min_mix_speakers=args.min_mix_speakers,
                 min_duration=args.min_duration,
                 japanese_only=args.japanese_only,
-            ):
-                skipped_ids.append(sample_id)
-                continue
-            copied_ids.append(
-                copy_sample(
-                    json_path,
-                    payload,
-                    audio_src,
-                    source_dir,
-                    output_dir,
-                    force=args.force,
-                )
+                report_row=report_row,
+                max_der=args.max_der,
+                max_confusion=args.max_confusion,
+                max_missed_detection=args.max_missed_detection,
+                max_false_alarm=args.max_false_alarm,
+                max_speaker_count_diff=args.max_speaker_count_diff,
             )
+            if filter_failures and report_row.get("ref_speaker_count") >= report_row.get("hyp_speaker_count"):
+                skipped_samples.append((sample_id, filter_failures))
+                continue
+            if args.dry_run:
+                copied_ids.append(sample_id)
+            else:
+                copied_ids.append(
+                    copy_sample(
+                        json_path,
+                        payload,
+                        audio_src,
+                        source_dir,
+                        output_dir,
+                        force=args.force,
+                    )
+                )
         except Exception as exc:
             failed_samples.append(sample_id)
-            print(f"Skipping failed sample {sample_id}: {exc}")
+            print(f"Skipping failed sample {sample_id} {report_row}: {exc}")
             continue
 
-    print(f"Prepared {len(copied_ids)} samples in {output_dir}")
+    if args.dry_run:
+        print(f"Dry run: would prepare {len(copied_ids)} samples in {output_dir}")
+    else:
+        print(f"Prepared {len(copied_ids)} samples in {output_dir}")
     for sample_id in copied_ids:
         print(f"- {sample_id}")
-    if skipped_ids:
+    if skipped_samples:
         print(
-            f"Skipped {len(skipped_ids)} samples by filters "
+            f"Skipped {len(skipped_samples)} samples by filters "
             f"(min_segments={args.min_segments}, "
             f"min_mix_speakers={args.min_mix_speakers}, "
             f"min_duration={args.min_duration}, "
             f"japanese_only={args.japanese_only}, "
+            f"report_path={resolved_report_path}, "
+            f"max_der={args.max_der}, "
+            f"max_confusion={args.max_confusion}, "
+            f"max_missed_detection={args.max_missed_detection}, "
+            f"max_false_alarm={args.max_false_alarm}, "
+            f"max_speaker_count_diff={args.max_speaker_count_diff}, "
             f"min_japanese_ratio={DEFAULT_MIN_JAPANESE_RATIO}, "
             f"japanese_segment_confidence_threshold="
             f"{DEFAULT_JAPANESE_SEGMENT_CONFIDENCE_THRESHOLD})"
         )
+        for sample_id, reasons in skipped_samples:
+            print(f"- {sample_id}: {', '.join(reasons)}")
     if failed_samples:
         print(f"Skipped {len(failed_samples)} samples due to errors")
         for sample_id in failed_samples:

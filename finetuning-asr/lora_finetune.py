@@ -727,13 +727,6 @@ def run_inference_on_test_set(
     Returns:
         List of inference results with predictions and ground truth
     """
-    # Set seed for reproducibility
-    torch.manual_seed(seed)
-    np.random.seed(seed)
-    random.seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
-
     model.eval()
     results = []
     logits_processor = (
