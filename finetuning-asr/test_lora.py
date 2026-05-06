@@ -657,6 +657,7 @@ def main() -> None:
         skip_overlap=args.der_skip_overlap,
     )
     aggregate_der_files = 0
+    individual_ders: List[float] = []
     results: List[Dict[str, Any]] = []
 
     batch_mode = args.input_dir is not None
@@ -699,6 +700,7 @@ def main() -> None:
                 collar=args.der_collar,
                 skip_overlap=args.der_skip_overlap,
             )
+            individual_ders.append(der_metrics["der"])
             aggregate_metric(
                 _annotation_from_rttm_lines(reference_rttm_lines, item["file_id"]),
                 _annotation_from_rttm_lines(hypothesis_rttm_lines, item["file_id"]),
@@ -757,18 +759,25 @@ def main() -> None:
             )
         print(status)
 
+    # Calculate simple average DER
+    aggregate_der = None
+    if individual_ders:
+        simple_avg_der = sum(individual_ders) / len(individual_ders)
+        aggregate_der = {
+            "evaluated_files": aggregate_der_files,
+            "collar": args.der_collar,
+            "skip_overlap": args.der_skip_overlap,
+            "der": simple_avg_der,
+            "der_percent": simple_avg_der * 100.0,
+        }
+
     summary = {
         "mode": "batch" if batch_mode else "single",
         "base_model": args.base_model,
         "lora_path": args.lora_path,
         "device": args.device,
         "num_files": len(results),
-        "der": _summarize_aggregate_der(
-            aggregate_metric,
-            aggregate_der_files,
-            args.der_collar,
-            args.der_skip_overlap,
-        ),
+        "der": aggregate_der,
         "results": results,
     }
 
