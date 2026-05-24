@@ -131,6 +131,11 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Skip samples whose absolute difference between ref_speaker_count and hyp_speaker_count exceeds this threshold. 0 means exact match.",
     )
+    parser.add_argument(
+        "--ignore-der-when-hyp-speakers-exceed-ref",
+        action="store_true",
+        help="Ignore DER-related report threshold failures when hyp_speaker_count is greater than ref_speaker_count.",
+    )
     return parser.parse_args()
 
 
@@ -313,6 +318,43 @@ def collect_report_filter_failures(
             f">{max_speaker_count_diff}"
         )
     return failures
+
+
+def hyp_speakers_exceed_ref(report_row: Dict[str, Any] | None) -> bool:
+    if report_row is None:
+        return False
+    ref_speaker_count = report_row.get("ref_speaker_count")
+    hyp_speaker_count = report_row.get("hyp_speaker_count")
+    if ref_speaker_count is None or hyp_speaker_count is None:
+        return False
+    return int(hyp_speaker_count) > int(ref_speaker_count)
+
+
+def is_der_related_failure(reason: str) -> bool:
+    return reason.startswith(
+        (
+            "der=",
+            "confusion=",
+            "missed_detection=",
+            "false_alarm=",
+            "missing_der",
+            "missing_confusion",
+            "missing_missed_detection",
+            "missing_false_alarm",
+        )
+    )
+
+
+def filter_ignored_report_failures(
+    failures: List[str],
+    report_row: Dict[str, Any] | None,
+    ignore_der_when_hyp_speakers_exceed_ref: bool,
+) -> List[str]:
+    if not ignore_der_when_hyp_speakers_exceed_ref:
+        return failures
+    if not hyp_speakers_exceed_ref(report_row):
+        return failures
+    return [reason for reason in failures if not is_der_related_failure(reason)]
 
 
 def build_sample_id(json_path: Path, source_dir: Path) -> str:
@@ -630,7 +672,8 @@ def collect_sample_filter_failures(
     max_missed_detection: float | None,
     max_false_alarm: float | None,
     max_speaker_count_diff: int | None,
- ) -> List[str]:
+    ignore_der_when_hyp_speakers_exceed_ref: bool,
+) -> List[str]:
     failures: List[str] = []
     segment_count = count_segments(payload)
     if segment_count < min_segments:
@@ -647,14 +690,19 @@ def collect_sample_filter_failures(
             failures.append(
                 f"japanese_ratio={japanese_ratio:.6f}<{DEFAULT_MIN_JAPANESE_RATIO}"
             )
-    failures.extend(
-        collect_report_filter_failures(
+    report_failures = collect_report_filter_failures(
         report_row,
         max_der=max_der,
         max_confusion=max_confusion,
         max_missed_detection=max_missed_detection,
         max_false_alarm=max_false_alarm,
         max_speaker_count_diff=max_speaker_count_diff,
+    )
+    failures.extend(
+        filter_ignored_report_failures(
+            report_failures,
+            report_row,
+            ignore_der_when_hyp_speakers_exceed_ref,
         )
     )
     return failures
@@ -706,12 +754,13 @@ def main() -> int:
 
     report_index: Dict[str, Dict[str, Any]] = {}
     resolved_report_path = resolve_report_path(source_dir, args.report_path)
-    if resolved_report_path is None or not resolved_report_path.exists():
-        raise FileNotFoundError(
-            "Report threshold filters were requested, but report.csv/report.json was not found. "
-            f"source_dir={source_dir}"
-        )
-    report_index = load_report_index(resolved_report_path)
+    if report_thresholds_enabled(args):
+        if resolved_report_path is None or not resolved_report_path.exists():
+            raise FileNotFoundError(
+                "Report threshold filters were requested, but report.csv/report.json was not found. "
+                f"source_dir={source_dir}"
+            )
+        report_index = load_report_index(resolved_report_path)
 
     if not args.dry_run:
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -738,8 +787,11 @@ def main() -> int:
                 max_missed_detection=args.max_missed_detection,
                 max_false_alarm=args.max_false_alarm,
                 max_speaker_count_diff=args.max_speaker_count_diff,
+                ignore_der_when_hyp_speakers_exceed_ref=(
+                    args.ignore_der_when_hyp_speakers_exceed_ref
+                ),
             )
-            if filter_failures and report_row.get("ref_speaker_count") >= report_row.get("hyp_speaker_count"):
+            if filter_failures:
                 skipped_samples.append((sample_id, filter_failures))
                 continue
             if args.dry_run:
@@ -779,6 +831,8 @@ def main() -> int:
             f"max_missed_detection={args.max_missed_detection}, "
             f"max_false_alarm={args.max_false_alarm}, "
             f"max_speaker_count_diff={args.max_speaker_count_diff}, "
+            f"ignore_der_when_hyp_speakers_exceed_ref="
+            f"{args.ignore_der_when_hyp_speakers_exceed_ref}, "
             f"min_japanese_ratio={DEFAULT_MIN_JAPANESE_RATIO}, "
             f"japanese_segment_confidence_threshold="
             f"{DEFAULT_JAPANESE_SEGMENT_CONFIDENCE_THRESHOLD})"
